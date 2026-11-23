@@ -2,7 +2,7 @@
 local RAW_URL = "https://raw.githubusercontent.com/jakrjone123/DeltaSuite-BloxFruits/main/BloxFruitsSilent.luau"
 
 local ok, source = pcall(function()
-    return game:HttpGet(RAW_URL)
+    return game:HttpGet(RAW_URL .. "?cb=" .. tostring(os.time()))
 end)
 
 if not ok or type(source) ~= "string" or #source == 0 then

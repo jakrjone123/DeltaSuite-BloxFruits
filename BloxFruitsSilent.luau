@@ -145,7 +145,7 @@ local Config = {
         TargetPart = "Chest", -- Chest | RootPart | Closest Body (never Head)
         Priority = "Crosshair", -- Crosshair | Closest | Lowest HP
         MaxDistance = 1500,
-        UseFOV = true, -- Generous crosshair cone prevents hijacking NPCs/fruits behind you
+        UseFOV = false, -- Locks players in view / close combat immediately without needing a key or tight FOV
         FOV = 340,
         ShowFOV = false,
         ShowLeadLine = true,
@@ -554,6 +554,8 @@ HookState.EquippedTool = nil
 HookState.ToolKind = ""
 HookState.AllowMouseOverride = false
 HookState.TargetDist = math.huge
+local MyRunToken = (tonumber(HookState.RunToken) or 0) + 1
+HookState.RunToken = MyRunToken
 
 local function isSilentHookReady(isGunRemote: boolean?, forMouse: boolean?): boolean
     if not Session.IsAlive() or not HookState.Active or HookState.PredPos == nil then
@@ -722,12 +724,25 @@ pcall(function()
     end
 end)
 
+local NativeRSMouse: { [string]: any } = {}
+local NativeRSMouseHas: { [string]: boolean } = {}
+local RSMOUSE_INTERCEPT_KEYS: { [string]: boolean } = {
+    Hit = true,
+    Target = true,
+    Origin = true,
+    UnitRay = true,
+}
+
 local function clearRSMouseRawKeys()
     if not RSMouseTbl then return end
-    if rawget(RSMouseTbl, "Hit") ~= nil then rawset(RSMouseTbl, "Hit", nil) end
-    if rawget(RSMouseTbl, "Target") ~= nil then rawset(RSMouseTbl, "Target", nil) end
-    if rawget(RSMouseTbl, "Origin") ~= nil then rawset(RSMouseTbl, "Origin", nil) end
-    if rawget(RSMouseTbl, "UnitRay") ~= nil then rawset(RSMouseTbl, "UnitRay", nil) end
+    for k in pairs(RSMOUSE_INTERCEPT_KEYS) do
+        local rv = rawget(RSMouseTbl, k)
+        if rv ~= nil then
+            NativeRSMouse[k] = rv
+            NativeRSMouseHas[k] = true
+            rawset(RSMouseTbl, k, nil)
+        end
+    end
 end
 clearRSMouseRawKeys()
 
@@ -744,14 +759,21 @@ local function syncMouseTable(tbl: { [string]: any }?)
     end
 end
 
+HookState.ReadyFn = isSilentHookReady
+HookState.HitCFrameFn = getHookHitCFrame
+HookState.SyncTableFn = syncMouseTable
+HookState.ClearRSMouseFn = clearRSMouseRawKeys
+HookState.NativeRSMouse = NativeRSMouse
+HookState.NativeRSMouseHas = NativeRSMouseHas
+
 ;(function()
     local hasNewC = (type(newcclosure) == "function")
     local wrapC: (any) -> any = hasNewC and newcclosure or function(fn) return fn end
 
-    if (tonumber(rawget(Env, "__BFSilentWrapperHookVer")) or 0) < 4 then
-        Env.__BFSilentWrapperHookVer = 4
+    if (tonumber(rawget(Env, "__BFSilentWrapperHookVer")) or 0) < 5 then
+        Env.__BFSilentWrapperHookVer = 5
 
-        -- Hook Global.updateMouseWrapper so Blox Fruits' per-frame wrapper update writes Silent Hit/Target ONLY when safe
+        -- Hook Global.updateMouseWrapper so Blox Fruits' per-frame wrapper update writes Silent Hit/Target dynamically
         pcall(function()
             local gMod = ReplicatedStorage:FindFirstChild("Global")
             if gMod and gMod:IsA("ModuleScript") and hookfunction then
@@ -761,9 +783,11 @@ end
                     origUmw = hookfunction(gTbl.updateMouseWrapper, wrapC(function(tbl, ...)
                         local res = table.pack(origUmw(tbl, ...))
                         if type(tbl) == "table" and tbl ~= RSMouseTbl then
-                            syncMouseTable(tbl)
+                            local syncFn = HookState.SyncTableFn
+                            if syncFn then syncFn(tbl) end
                         end
-                        clearRSMouseRawKeys()
+                        local clrFn = HookState.ClearRSMouseFn
+                        if clrFn then clrFn() end
                         return table.unpack(res, 1, res.n)
                     end))
                 end
@@ -781,7 +805,8 @@ end
                         origWm = hookfunction(wmFn, wrapC(function(...)
                             local tbl, disc = origWm(...)
                             if type(tbl) == "table" and tbl ~= RSMouseTbl then
-                                syncMouseTable(tbl)
+                                local syncFn = HookState.SyncTableFn
+                                if syncFn then syncFn(tbl) end
                             end
                             return tbl, disc
                         end))
@@ -791,15 +816,16 @@ end
         end
     end
 
-    if rawget(Env, "__BFSilentHooksInstalled") then
+    if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 3 then
         return
     end
+    Env.__BFSilentCoreHookVer = 3
     Env.__BFSilentHooksInstalled = true
 
     local PlayerMouse: Mouse? = nil
     pcall(function() PlayerMouse = LocalPlayer:GetMouse() end)
 
-    -- 1. ReplicatedStorage.Mouse metatable hook (strictly gated; never rawsets permanent keys)
+    -- 1. ReplicatedStorage.Mouse metatable hook (__index + __newindex virtualized so tools can't bypass via raw write)
     pcall(function()
         local rsMouseMod = ReplicatedStorage:FindFirstChild("Mouse")
         if rsMouseMod and rsMouseMod:IsA("ModuleScript") and getrawmetatable then
@@ -807,11 +833,33 @@ end
             local mt = getrawmetatable(mTbl)
             if mt and type(mt.__index) == "function" then
                 if setreadonly then pcall(setreadonly, mt, false) end
-                local origIdx = mt.__index
+                local origIdx = rawget(Env, "__BFOrigRSMouseIdx") or mt.__index
+                Env.__BFOrigRSMouseIdx = origIdx
+                local origNewIdx = rawget(Env, "__BFOrigRSMouseNewIdx") or mt.__newindex
+                if origNewIdx ~= nil then Env.__BFOrigRSMouseNewIdx = origNewIdx end
+
+                mt.__newindex = wrapC(function(self, key, val)
+                    if key == "Hit" or key == "Target" or key == "Origin" or key == "UnitRay" then
+                        local nat = HookState.NativeRSMouse
+                        local natHas = HookState.NativeRSMouseHas
+                        if nat and natHas then
+                            nat[key] = val
+                            natHas[key] = true
+                        end
+                        return
+                    end
+                    if type(origNewIdx) == "function" then
+                        return origNewIdx(self, key, val)
+                    end
+                    rawset(self, key, val)
+                end)
+
                 mt.__index = wrapC(function(self, key)
-                    if isSilentHookReady(false, true) then
+                    local readyFn = HookState.ReadyFn
+                    if readyFn and readyFn(false, true) then
                         if key == "Hit" then
-                            local cf = getHookHitCFrame()
+                            local cfFn = HookState.HitCFrameFn
+                            local cf = cfFn and cfFn()
                             if cf then return cf end
                         elseif key == "Target" and HookState.TargetPart then
                             return HookState.TargetPart
@@ -823,6 +871,13 @@ end
                             return Ray.new(HookState.ShotOrigin, (p - HookState.ShotOrigin).Unit)
                         end
                     end
+                    if key == "Hit" or key == "Target" or key == "Origin" or key == "UnitRay" then
+                        local nat = HookState.NativeRSMouse
+                        local natHas = HookState.NativeRSMouseHas
+                        if nat and natHas and natHas[key] then
+                            return nat[key]
+                        end
+                    end
                     return origIdx(self, key)
                 end)
                 HookState.RSMouseHooked = true
@@ -830,7 +885,7 @@ end
         end
     end)
 
-    -- 2. MovesetUtil.Aim.fromMouse hook (direct MovesetV2 aim helper)
+    -- 2. MovesetUtil.Aim.fromMouse hook (reload-safe dynamic dispatch)
     pcall(function()
         local mu = ReplicatedStorage:FindFirstChild("MovesetUtil")
         local aimMod = mu and mu:FindFirstChild("Aim")
@@ -839,7 +894,8 @@ end
             if type(aimTbl) == "table" and type(aimTbl.fromMouse) == "function" then
                 local origFromMouse
                 origFromMouse = hookfunction(aimTbl.fromMouse, wrapC(function(ctx)
-                    if isSilentHookReady(false, true) and HookState.PredPos then
+                    local readyFn = HookState.ReadyFn
+                    if readyFn and readyFn(false, true) and HookState.PredPos then
                         return HookState.PredPos
                     end
                     return origFromMouse(ctx)
@@ -848,7 +904,7 @@ end
         end
     end)
 
-    -- 3. Util.GetMousePoint & CombatUtil.GetTargetPosition hooks (Guns & Hitscan)
+    -- 3. Util.GetMousePoint & CombatUtil.GetTargetPosition hooks (reload-safe dynamic dispatch)
     pcall(function()
         local util = ReplicatedStorage:FindFirstChild("Util")
         local gmp = util and util:FindFirstChild("GetMousePoint")
@@ -857,7 +913,8 @@ end
             if type(gmpFn) == "function" then
                 local origGmp
                 origGmp = hookfunction(gmpFn, wrapC(function(...)
-                    if isSilentHookReady(true, true) and HookState.PredPos then
+                    local readyFn = HookState.ReadyFn
+                    if readyFn and readyFn(true, true) and HookState.PredPos then
                         return HookState.PredPos
                     end
                     return origGmp(...)
@@ -871,7 +928,8 @@ end
             if type(cu) == "table" and type(cu.GetTargetPosition) == "function" then
                 local origGTP
                 origGTP = hookfunction(cu.GetTargetPosition, wrapC(function(...)
-                    if isSilentHookReady(true, true) and HookState.PredPos then
+                    local readyFn = HookState.ReadyFn
+                    if readyFn and readyFn(true, true) and HookState.PredPos then
                         return HookState.PredPos
                     end
                     return origGTP(...)
@@ -880,23 +938,27 @@ end
         end
     end)
 
-    -- 4. game __index hook (only when newcclosure exists and safe for UI/NPC/Fruit clicks)
+    -- 4. game __index hook (reload-safe dynamic dispatch; only when newcclosure exists)
     pcall(function()
         if hookmetamethod and checkcaller and hasNewC then
             local origGameIndex
             origGameIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
-                if not checkcaller() and PlayerMouse and typeof(self) == "Instance" and rawequal(self, PlayerMouse) and isSilentHookReady(false, true) then
-                    if key == "Hit" then
-                        local cf = getHookHitCFrame()
-                        if cf then return cf end
-                    elseif key == "Target" and HookState.TargetPart then
-                        return HookState.TargetPart
-                    elseif key == "Origin" then
-                        local p = HookState.PredPos :: Vector3
-                        return CFrame.lookAt(HookState.ShotOrigin, p)
-                    elseif key == "UnitRay" then
-                        local p = HookState.PredPos :: Vector3
-                        return Ray.new(HookState.ShotOrigin, (p - HookState.ShotOrigin).Unit)
+                if not checkcaller() and PlayerMouse and typeof(self) == "Instance" and rawequal(self, PlayerMouse) then
+                    local readyFn = HookState.ReadyFn
+                    if readyFn and readyFn(false, true) then
+                        if key == "Hit" then
+                            local cfFn = HookState.HitCFrameFn
+                            local cf = cfFn and cfFn()
+                            if cf then return cf end
+                        elseif key == "Target" and HookState.TargetPart then
+                            return HookState.TargetPart
+                        elseif key == "Origin" then
+                            local p = HookState.PredPos :: Vector3
+                            return CFrame.lookAt(HookState.ShotOrigin, p)
+                        elseif key == "UnitRay" then
+                            local p = HookState.PredPos :: Vector3
+                            return Ray.new(HookState.ShotOrigin, (p - HookState.ShotOrigin).Unit)
+                        end
                     end
                 end
                 return origGameIndex(self, key)
@@ -1351,8 +1413,15 @@ local function evaluateSilentTarget(cam: Camera, origin3D: Vector3, aim2D: Vecto
 
         local sp, onScr = cam:WorldToViewportPoint(part.Position)
         local screenDist = (sp.Z > 0.35) and (Vector2.new(sp.X, sp.Y) - aim2D).Magnitude or math.huge
-        if useFov and (sp.Z <= 0.35 or screenDist > fovLim) then
-            continue
+        if useFov then
+            if sp.Z <= 0.35 or screenDist > fovLim then
+                continue
+            end
+        else
+            local offscreenCap = onlyPlayer and 550 or 260
+            if (sp.Z <= 0.35 or not onScr) and worldDist > offscreenCap then
+                continue
+            end
         end
 
         local score: number
@@ -1497,7 +1566,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v4.1"
+TitleLbl.Text = "DELTA · Blox Fruits v4.2"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2078,6 +2147,12 @@ local NON_COMBAT_ITEM_PATTERNS = {
     "gift",
 }
 
+local NON_COMBAT_TOOLTIPS: { [string]: boolean } = {
+    wear = true,
+    jobtool = true,
+    accessory = true,
+}
+
 local function classifyEquippedTool(ch: Model?): (boolean, Tool?, string)
     if not ch then
         return false, nil, ""
@@ -2089,8 +2164,16 @@ local function classifyEquippedTool(ch: Model?): (boolean, Tool?, string)
         end
         return false, nil, ""
     end
-    -- Physical uneaten Devil Fruits / utility items must NEVER be treated as combat silent-aim weapons
+    -- Physical uneaten Devil Fruits, wearables & utility items must NEVER be treated as combat silent-aim weapons
     if tool:FindFirstChild("Eat") or tool:FindFirstChild("EatRemote") or tool:FindFirstChild("DropRemote") or tool:FindFirstChild("FruitModel") or tool:FindFirstChild("Store") then
+        return false, tool, ""
+    end
+    local tipLow = tostring(tool.ToolTip or ""):lower()
+    if NON_COMBAT_TOOLTIPS[tipLow] then
+        return false, tool, ""
+    end
+    local typeVal = tool:FindFirstChild("Type")
+    if typeVal and typeVal:IsA("StringValue") and typeVal.Value:lower() == "accessory" then
         return false, tool, ""
     end
     local nameLow = tool.Name:lower()
@@ -2126,17 +2209,26 @@ local function detectCursorAndNpcConflict(cam: Camera, aim2D: Vector2, origin3D:
         return true, math.huge, "Chat/Box"
     end
 
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        local pgMain = pg:FindFirstChild("Main")
+        local dlg = pgMain and pgMain:FindFirstChild("Dialogue")
+        if dlg and dlg:IsA("GuiObject") and dlg.Visible then
+            return true, math.huge, "Dialogue"
+        end
+    end
+
     local isShiftLock = (UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter)
     if not isShiftLock then
         local rawMouse = UserInputService:GetMouseLocation()
-        if MenuVisible then
+        -- Only yield to our own Menu while actively clicking/dragging inside it (leave open while testing!)
+        if MenuVisible and MainWin.Visible and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
             local mp, ms = MainWin.AbsolutePosition, MainWin.AbsoluteSize
             if rawMouse.X >= mp.X and rawMouse.X <= mp.X + ms.X and rawMouse.Y >= mp.Y and rawMouse.Y <= mp.Y + ms.Y then
-                return true, math.huge, "Menu"
+                return true, math.huge, "Menu Click"
             end
         end
 
-        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         if pg then
             local vpSize = cam.ViewportSize
             local inset = GuiService:GetGuiInset()
@@ -2148,6 +2240,15 @@ local function detectCursorAndNpcConflict(cam: Camera, aim2D: Vector2, origin3D:
                     if not g:IsA("GuiObject") or not g.Visible then continue end
                     local sz = g.AbsoluteSize
                     if sz.X > vpSize.X * 0.55 and sz.Y > vpSize.Y * 0.55 then continue end
+                    local ancVis = true
+                    local cur: Instance? = g.Parent
+                    while cur and cur ~= pg do
+                        if cur:IsA("GuiObject") and not cur.Visible then ancVis = false; break end
+                        if cur:IsA("ScreenGui") and not cur.Enabled then ancVis = false; break end
+                        if cur:IsA("CanvasGroup") and cur.GroupTransparency >= 0.99 then ancVis = false; break end
+                        cur = cur.Parent
+                    end
+                    if not ancVis then continue end
                     if (g:IsA("GuiButton") or g:IsA("TextBox")) and g.Active then
                         local hasVisual = g.BackgroundTransparency < 0.98
                             or (g:IsA("TextButton") and g.Text ~= "")
@@ -2191,7 +2292,7 @@ local function detectCursorAndNpcConflict(cam: Camera, aim2D: Vector2, origin3D:
         then
             return true, 0, "Interact"
         end
-        local droppedTool = inst:FindFirstAncestorOfClass("Tool")
+        local droppedTool = inst:FindFirstChildOfClass("Tool") or inst:FindFirstAncestorOfClass("Tool")
         if droppedTool and not Players:GetPlayerFromCharacter(droppedTool.Parent :: any) then
             return true, 0, "Fruit/Drop"
         end
@@ -2207,6 +2308,22 @@ local function detectCursorAndNpcConflict(cam: Camera, aim2D: Vector2, origin3D:
                 or mdl.Name:lower():find("fruit", 1, true) ~= nil
             then
                 return true, 0, "NPC/Fruit"
+            end
+        end
+    end
+
+    -- Proximity check for friendly NPCs right beside you (safe even if NPC Humanoid parts have CanQuery = false)
+    local npcsFolder = Workspace:FindFirstChild("NPCs")
+    if npcsFolder then
+        for _, npc in ipairs(npcsFolder:GetChildren()) do
+            if npc:IsA("Model") then
+                local nRoot = (npc:FindFirstChild("UpperTorso") :: BasePart?) or (npc:FindFirstChild("HumanoidRootPart") :: BasePart?) or npc.PrimaryPart
+                if nRoot and (nRoot.Position - origin3D).Magnitude <= 40 then
+                    local sp, onScr = cam:WorldToViewportPoint(nRoot.Position)
+                    if onScr and sp.Z > 0.35 and (Vector2.new(sp.X, sp.Y) - aim2D).Magnitude <= 70 then
+                        return true, 0, "NPC"
+                    end
+                end
             end
         end
     end
@@ -2635,14 +2752,17 @@ RunService:BindToRenderStep("DeltaBFSilentESP", Enum.RenderPriority.Last.Value, 
 end)
 
 Session.OnStop(function()
-    HookState.Active = false
-    HookState.AllowMouseOverride = false
-    HookState.HasCombatTool = false
-    HookState.EquippedTool = nil
-    HookState.PredPos = nil
-    HookState.TargetPart = nil
-    HookState.TargetDist = math.huge
-    clearRSMouseRawKeys()
+    if HookState.RunToken == MyRunToken then
+        HookState.Active = false
+        HookState.AllowMouseOverride = false
+        HookState.HasCombatTool = false
+        HookState.EquippedTool = nil
+        HookState.PredPos = nil
+        HookState.TargetPart = nil
+        HookState.TargetDist = math.huge
+        HookState.ReadyFn = nil
+        clearRSMouseRawKeys()
+    end
     pcall(RunService.UnbindFromRenderStep, RunService, "DeltaBFSilentESP")
     for _, e in pairs(PlayerEsp) do
         destroyEspEntry(e)

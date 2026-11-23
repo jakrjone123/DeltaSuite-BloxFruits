@@ -135,17 +135,17 @@ export type BindValue = Enum.KeyCode | Enum.UserInputType
 local Config = {
     Silent = {
         Enabled = true,
-        Key = Enum.KeyCode.RightAlt :: BindValue,
+        Key = Enum.KeyCode.Unknown :: BindValue, -- None needed (Always active by default)
         Mode = "Always", -- Always | Hold | Toggle
         ApplySkills = true, -- Fruit / Sword / Melee MovesetV2 & Classic skills
         ApplyGunsM1 = true, -- Gun shots & M1 projectiles
-        AutoFaceCast = true, -- Snap character yaw/direction toward target when firing skills
-        TargetPart = "RootPart", -- RootPart | Head | UpperTorso | Closest
+        AutoFaceCast = false, -- Optional yaw snap on skill keys (keep off for free movement)
+        TargetPart = "Chest", -- Chest | RootPart | Closest Body (never Head)
         Priority = "Crosshair", -- Crosshair | Closest | Lowest HP
         MaxDistance = 1500,
-        UseFOV = true,
-        FOV = 250,
-        ShowFOV = true,
+        UseFOV = false, -- Wide/unlimited lock by default so skills hit without small FOV restriction
+        FOV = 340,
+        ShowFOV = false,
         ShowLeadLine = true,
         StickyLock = true,
         TeamCheck = true, -- Ignores Allies + same-Marine (Pirates vs Pirates remain valid targets)
@@ -251,6 +251,7 @@ function BF.IsPlayerAlive(player: Player, model: Model?): (boolean, Humanoid?, B
     local root = (model:FindFirstChild("HumanoidRootPart") :: BasePart?)
         or model.PrimaryPart
         or (model:FindFirstChild("UpperTorso") :: BasePart?)
+        or (model:FindFirstChild("Torso") :: BasePart?)
         or (model:FindFirstChild("Head") :: BasePart?)
     if not hum or not root or hum.Health <= 0 then
         return false, nil, nil
@@ -509,6 +510,14 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
         end
     end
 
+    if predPos.X ~= predPos.X or predPos.Y ~= predPos.Y or predPos.Z ~= predPos.Z then
+        return basePos
+    end
+    local leadVec = predPos - basePos
+    if leadVec.Magnitude > 140 then
+        predPos = basePos + leadVec.Unit * 140
+    end
+
     return predPos
 end
 
@@ -571,9 +580,11 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     local lpChar = LocalPlayer.Character
     if not lpChar then return false end
 
-    local isNetGun = (selfInst.Name == "RE/ShootGunEvent" or selfInst.Name == "RemoteFunctionShoot")
+    local iName = selfInst.Name
+    local isNetGun = (iName == "RE/ShootGunEvent" or iName == "RemoteFunctionShoot")
     local isToolRemote = selfInst:IsDescendantOf(lpChar)
-    local isCommE = (selfInst.Name == "CommE" or selfInst.Name == "CommF_")
+        and (iName == "RemoteEvent" or iName == "RemoteFunction" or iName == "LeftClickRemote" or iName == "RemoteFunctionShoot")
+    local isCommE = (iName == "CommE")
     if not isNetGun and not isToolRemote and not isCommE then
         return false
     end
@@ -581,10 +592,10 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
         return false
     end
 
-    -- Ignore utility CommE calls (Buso, Ken, Dodge, Soru, Geppo)
+    -- Ignore utility & mobility CommE calls so movement/dash/Soru/Geppo stay 100% free
     if isCommE and type(args[1]) == "string" then
         local cmd = args[1]
-        if cmd == "Buso" or cmd == "Ken" or cmd == "Dodge" or cmd == "Geppo" or cmd == "Soru" then
+        if cmd == "Buso" or cmd == "Ken" or cmd == "Dodge" or cmd == "Geppo" or cmd == "Soru" or cmd == "Dash" then
             return false
         end
     end
@@ -635,6 +646,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     end
     return changed
 end
+HookState.RedirectFn = redirectRemoteArgs
 
 local RSMouseTbl: { [string]: any }? = nil
 pcall(function()
@@ -658,15 +670,14 @@ local function syncMouseTable(tbl: { [string]: any }?)
     if HookState.TargetPart then
         rawset(tbl, "Target", HookState.TargetPart)
     end
-    rawset(tbl, "X", HookState.ScreenPos.X)
-    rawset(tbl, "Y", HookState.ScreenPos.Y)
 end
 
 ;(function()
-    local wrapC: (any) -> any = (type(newcclosure) == "function") and newcclosure or function(fn) return fn end
+    local hasNewC = (type(newcclosure) == "function")
+    local wrapC: (any) -> any = hasNewC and newcclosure or function(fn) return fn end
 
-    if (tonumber(rawget(Env, "__BFSilentWrapperHookVer")) or 0) < 2 then
-        Env.__BFSilentWrapperHookVer = 2
+    if (tonumber(rawget(Env, "__BFSilentWrapperHookVer")) or 0) < 3 then
+        Env.__BFSilentWrapperHookVer = 3
 
         -- Hook Global.updateMouseWrapper so Blox Fruits' per-frame wrapper update writes our Silent Hit/Target
         pcall(function()
@@ -718,7 +729,7 @@ end
     local PlayerMouse: Mouse? = nil
     pcall(function() PlayerMouse = LocalPlayer:GetMouse() end)
 
-    -- 1. ReplicatedStorage.Mouse metatable hook (backup for dynamic key reads)
+    -- 1. ReplicatedStorage.Mouse metatable hook (never touches screen X/Y cursor inputs)
     pcall(function()
         local rsMouseMod = ReplicatedStorage:FindFirstChild("Mouse")
         if rsMouseMod and rsMouseMod:IsA("ModuleScript") and getrawmetatable then
@@ -740,10 +751,6 @@ end
                         elseif key == "UnitRay" then
                             local p = HookState.PredPos :: Vector3
                             return Ray.new(HookState.ShotOrigin, (p - HookState.ShotOrigin).Unit)
-                        elseif key == "X" then
-                            return HookState.ScreenPos.X
-                        elseif key == "Y" then
-                            return HookState.ScreenPos.Y
                         end
                     end
                     return origIdx(self, key)
@@ -802,11 +809,11 @@ end
         end
     end)
 
-    -- 4. game __index hook (LocalPlayer:GetMouse() for Classic fruits/tools)
+    -- 4. game __index hook (only when newcclosure exists, so ControlModule never crashes)
     pcall(function()
-        if hookmetamethod and checkcaller then
+        if hookmetamethod and checkcaller and hasNewC then
             local origGameIndex
-            origGameIndex = hookmetamethod(game, "__index", wrapC(function(self, key)
+            origGameIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
                 if not checkcaller() and PlayerMouse and self == PlayerMouse and isSilentHookReady(false) then
                     if key == "Hit" then
                         local cf = getHookHitCFrame()
@@ -826,16 +833,18 @@ end
         end
     end)
 
-    -- 5. game __namecall hook (Tool.RemoteEvent / RemoteFunction / CommE / RE/ShootGunEvent)
+    -- 5. game __namecall hook (strictly for combat/skill remotes; never blocks movement/dash)
     pcall(function()
-        if hookmetamethod and checkcaller and getnamecallmethod then
+        if hookmetamethod and checkcaller and getnamecallmethod and hasNewC then
             local origNamecall
-            origNamecall = hookmetamethod(game, "__namecall", wrapC(function(self, ...)
+            origNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                 if not checkcaller() and HookState.Active and HookState.PredPos then
                     local method = getnamecallmethod()
                     if method == "FireServer" or method == "InvokeServer" then
                         local args = table.pack(...)
-                        if redirectRemoteArgs(self, method, args, args.n) then
+                        local redir = HookState.RedirectFn or redirectRemoteArgs
+                        local okRedir, changed = pcall(redir, self, method, args, args.n)
+                        if okRedir and changed then
                             return origNamecall(self, table.unpack(args, 1, args.n))
                         end
                     end
@@ -1125,6 +1134,14 @@ local function computeBoxScreen(model: Model, root: BasePart, cam: Camera, vp: V
     return true, bx, by, bw, bh
 end
 
+local R6_BONE_PAIRS = {
+    { "Head", "Torso" },
+    { "Torso", "Left Arm" },
+    { "Torso", "Right Arm" },
+    { "Torso", "Left Leg" },
+    { "Torso", "Right Leg" },
+}
+
 local function updateSkeleton(d: { [string]: any }, model: Model, cam: Camera, vp: Vector2, col: Color3, on: boolean)
     if on then
         if not d.Bones then
@@ -1132,12 +1149,14 @@ local function updateSkeleton(d: { [string]: any }, model: Model, cam: Camera, v
             d.Bones = createLinePool(#BONE_PAIRS, 1.6, nil, drawTrans(1.0), 4)
         end
         d._Cleared = false
+        local pairsList = model:FindFirstChild("UpperTorso") and BONE_PAIRS or R6_BONE_PAIRS
         local maxSeg = math.max(vp.X, vp.Y) * 0.9
-        for i, pair in ipairs(BONE_PAIRS) do
+        for i = 1, #BONE_PAIRS do
+            local pair = pairsList[i]
             local ln = d.Bones[i]
             local out = d.BoneOutlines and d.BoneOutlines[i]
-            local p1 = model:FindFirstChild(pair[1])
-            local p2 = model:FindFirstChild(pair[2])
+            local p1 = pair and model:FindFirstChild(pair[1]) or nil
+            local p2 = pair and model:FindFirstChild(pair[2]) or nil
             if ln and p1 and p1:IsA("BasePart") and p2 and p2:IsA("BasePart") then
                 local v1, ok1 = cam:WorldToViewportPoint(p1.Position)
                 local v2, ok2 = cam:WorldToViewportPoint(p2.Position)
@@ -1187,10 +1206,10 @@ end
 
 local function pickAimPart(model: Model, origin2D: Vector2, cam: Camera): BasePart?
     local mode = Config.Silent.TargetPart
-    if mode == "Closest" then
+    if mode == "Closest Body" then
         local bestP: BasePart? = nil
         local bestD = math.huge
-        for _, name in ipairs({ "Head", "UpperTorso", "HumanoidRootPart", "LowerTorso" }) do
+        for _, name in ipairs({ "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }) do
             local pt = model:FindFirstChild(name)
             if pt and pt:IsA("BasePart") then
                 local sp, onScr = cam:WorldToViewportPoint(pt.Position)
@@ -1204,17 +1223,20 @@ local function pickAimPart(model: Model, origin2D: Vector2, cam: Camera): BasePa
             end
         end
         if bestP then return bestP end
+    elseif mode == "RootPart" then
+        local hrp = model:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp:IsA("BasePart") then return hrp end
     else
-        local partKey = (mode == "RootPart") and "HumanoidRootPart" or mode
-        local direct = model:FindFirstChild(partKey)
-        if direct and direct:IsA("BasePart") then
-            return direct
+        -- Default: always target the chest (UpperTorso R15 / Torso R6), never Head
+        local chest = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        if chest and chest:IsA("BasePart") then
+            return chest
         end
     end
-    return (model:FindFirstChild("HumanoidRootPart") :: BasePart?)
+    return (model:FindFirstChild("UpperTorso") :: BasePart?)
+        or (model:FindFirstChild("Torso") :: BasePart?)
+        or (model:FindFirstChild("HumanoidRootPart") :: BasePart?)
         or model.PrimaryPart
-        or (model:FindFirstChild("UpperTorso") :: BasePart?)
-        or (model:FindFirstChild("Head") :: BasePart?)
 end
 
 local function evaluateSilentTarget(cam: Camera, origin3D: Vector3, aim2D: Vector2, now: number, onlyPlayer: Player?, fovMult: number?): (Player?, Model?, BasePart?, Vector3?, number)
@@ -1250,17 +1272,19 @@ local function evaluateSilentTarget(cam: Camera, origin3D: Vector3, aim2D: Vecto
         local screenDist = (sp.Z > 0.35) and (Vector2.new(sp.X, sp.Y) - aim2D).Magnitude or math.huge
         if useFov and (sp.Z <= 0.35 or screenDist > fovLim) then
             continue
-        elseif not useFov and prio == "Crosshair" and (not onScr or sp.Z <= 0.35) then
-            continue
         end
 
         local score: number
         if prio == "Closest" then
             score = worldDist
         elseif prio == "Lowest HP" then
-            score = hum.Health * 100 + screenDist * 0.1
+            score = hum.Health * 100 + worldDist * 0.05
         else
-            score = screenDist
+            if onScr and sp.Z > 0.35 then
+                score = screenDist
+            else
+                score = 4000 + worldDist
+            end
         end
 
         if score < bestScore then
@@ -1278,6 +1302,7 @@ end
 local lastFaceSnapAt = 0
 local function snapCharacterToward(pos: Vector3)
     if not Config.Silent.AutoFaceCast then return end
+    if pos.X ~= pos.X or pos.Y ~= pos.Y or pos.Z ~= pos.Z then return end
     local ch = LocalPlayer.Character
     local root = ch and ch:FindFirstChild("HumanoidRootPart") :: BasePart?
     if not root then return end
@@ -1292,7 +1317,6 @@ local SKILL_KEYS = {
     [Enum.KeyCode.X] = true,
     [Enum.KeyCode.C] = true,
     [Enum.KeyCode.V] = true,
-    [Enum.KeyCode.F] = true,
 }
 
 -- ============================================================================
@@ -1350,7 +1374,7 @@ end
 local MainWin = Instance.new("Frame")
 MainWin.Name = "MainWindow"
 MainWin.Size = UDim2.fromOffset(472, 396)
-MainWin.Position = UDim2.new(0.5, -236, 0.5, -198)
+MainWin.Position = UDim2.new(0, 22, 0.5, -198)
 MainWin.BackgroundColor3 = THEME.BgMain
 MainWin.BackgroundTransparency = Config.Settings.MenuTransparency
 MainWin.ClipsDescendants = true
@@ -1628,6 +1652,14 @@ local function addSlider(parent: Instance, label: string, minV: number, maxV: nu
     valLbl.TextXAlignment = Enum.TextXAlignment.Right
     valLbl.Parent = wrap
 
+    local hitbox = Instance.new("TextButton")
+    hitbox.Position = UDim2.fromOffset(0, 13)
+    hitbox.Size = UDim2.new(1, 0, 0, 16)
+    hitbox.BackgroundTransparency = 1
+    hitbox.Text = ""
+    hitbox.AutoButtonColor = false
+    hitbox.Parent = wrap
+
     local track = Instance.new("Frame")
     track.Position = UDim2.fromOffset(2, 18)
     track.Size = UDim2.new(1, -4, 0, 6)
@@ -1663,7 +1695,7 @@ local function addSlider(parent: Instance, label: string, minV: number, maxV: nu
         sync()
     end
 
-    Session.Bind(track.InputBegan, function(inp: InputObject)
+    Session.Bind(hitbox.InputBegan, function(inp: InputObject)
         if inp.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true
             applyX(inp.Position.X)
@@ -1828,8 +1860,8 @@ addCycle(silentLeft, "Mode", { "Always", "Hold", "Toggle" }, function() return C
 addKeybind(silentLeft, "Silent Key", function() return Config.Silent.Key end, function(k) Config.Silent.Key = k end)
 addToggle(silentLeft, "Skills (Z/X/C/V/F)", function() return Config.Silent.ApplySkills end, function(v) Config.Silent.ApplySkills = v end)
 addToggle(silentLeft, "Guns & M1", function() return Config.Silent.ApplyGunsM1 end, function(v) Config.Silent.ApplyGunsM1 = v end)
-addToggle(silentLeft, "Auto Face on Cast", function() return Config.Silent.AutoFaceCast end, function(v) Config.Silent.AutoFaceCast = v end)
-addCycle(silentLeft, "HitPart", { "RootPart", "Head", "UpperTorso", "Closest" }, function() return Config.Silent.TargetPart end, function(v) Config.Silent.TargetPart = v end)
+addToggle(silentLeft, "Auto Face on Skill", function() return Config.Silent.AutoFaceCast end, function(v) Config.Silent.AutoFaceCast = v end)
+addCycle(silentLeft, "HitPart", { "Chest", "RootPart", "Closest Body" }, function() return Config.Silent.TargetPart end, function(v) Config.Silent.TargetPart = v end)
 addCycle(silentLeft, "Priority", { "Crosshair", "Closest", "Lowest HP" }, function() return Config.Silent.Priority end, function(v) Config.Silent.Priority = v end)
 addToggle(silentLeft, "Sticky Lock", function() return Config.Silent.StickyLock end, function(v) Config.Silent.StickyLock = v end)
 addToggle(silentLeft, "Team / Ally Check", function() return Config.Silent.TeamCheck end, function(v) Config.Silent.TeamCheck = v end)
@@ -1924,7 +1956,7 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
             ToggleStates.Silent = not (ToggleStates.Silent ~= false)
         end
     end
-    if isSilentHookReady(false) and HookState.PredPos and (SKILL_KEYS[inp.KeyCode] or inp.UserInputType == Enum.UserInputType.MouseButton1) then
+    if isSilentHookReady(false) and HookState.PredPos and SKILL_KEYS[inp.KeyCode] then
         local nowK = os.clock()
         if nowK - lastFaceSnapAt > 0.04 then
             lastFaceSnapAt = nowK
@@ -1936,7 +1968,7 @@ end)
 Session.Bind(UserInputService.InputEnded, function(inp: InputObject)
     local code: BindValue = (inp.KeyCode ~= Enum.KeyCode.Unknown) and inp.KeyCode or inp.UserInputType
     KeyHoldStates[code] = false
-    if isSilentHookReady(false) and HookState.PredPos and (SKILL_KEYS[inp.KeyCode] or inp.UserInputType == Enum.UserInputType.MouseButton1) then
+    if isSilentHookReady(false) and HookState.PredPos and SKILL_KEYS[inp.KeyCode] then
         local nowR = os.clock()
         if nowR - lastFaceSnapAt > 0.03 then
             lastFaceSnapAt = nowR
@@ -2095,13 +2127,204 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
             TargetStatusLbl.Text = string.format("Lock: %s (%dm)%s", targetPlr.DisplayName, distM, safeTxt)
             TargetStatusLbl.TextColor3 = THEME.Accent
         else
-            TargetStatusLbl.Text = silentOn and "Silent: Ready (Scanning)" or "Silent: Standby"
-            TargetStatusLbl.TextColor3 = THEME.TextMuted
+            TargetStatusLbl.Text = silentOn and "Silent: ACTIVE (No Key Needed)" or "Silent: Standby"
+            TargetStatusLbl.TextColor3 = silentOn and THEME.Success or THEME.TextMuted
         end
     end
 end)
 
 -- Post-Camera Player ESP Loop
+local function renderPlayerEsp(plr: Player, entry: EspEntry, cam: Camera, vp: Vector2, camPos: Vector3)
+    local ch = plr.Character
+    local alive, hum, root = BF.IsPlayerAlive(plr, ch)
+    if not Config.ESP.Enabled or not alive or not ch or not hum or not root then
+        hideEspDrawings(entry.Draw, entry.Highlight, false)
+        return
+    end
+
+    local isAlly = BF.IsAlly(plr)
+    if Config.ESP.TeamCheck and isAlly then
+        hideEspDrawings(entry.Draw, entry.Highlight, false)
+        return
+    end
+    local inSafe = BF.IsPlayerInSafeZone(plr, ch)
+    if inSafe and not Config.ESP.ShowSafeZone then
+        hideEspDrawings(entry.Draw, entry.Highlight, false)
+        return
+    end
+
+    local dist = (root.Position - camPos).Magnitude
+    if dist > Config.ESP.MaxDistance then
+        hideEspDrawings(entry.Draw, entry.Highlight, false)
+        return
+    end
+
+    local col = Config.ESP.EnemyColor
+    if ActiveLockPlayer == plr then
+        col = Config.ESP.LockedColor
+    elseif isAlly then
+        col = Config.ESP.AllyColor
+    elseif inSafe then
+        col = Config.ESP.SafeColor
+    end
+
+    -- Highlight Chams
+    if Config.ESP.Highlights then
+        if not entry.Highlight or entry.Highlight.Parent ~= ch then
+            if entry.Highlight then pcall(function() entry.Highlight:Destroy() end) end
+            local hl = Instance.new("Highlight")
+            hl.Name = "__DeltaBFChams"
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.FillTransparency = 0.65
+            hl.OutlineTransparency = 0.05
+            hl.Parent = ch
+            Session.Track(hl)
+            entry.Highlight = hl
+        end
+        entry.Highlight.FillColor = col
+        entry.Highlight.OutlineColor = Color3.new(1, 1, 1)
+        entry.Highlight.Enabled = true
+    elseif entry.Highlight then
+        entry.Highlight.Enabled = false
+    end
+
+    if not entry.Draw then
+        entry.Draw = createEspDrawings()
+    end
+    local d = entry.Draw :: { [string]: any }
+
+    -- Offscreen Arrow
+    if Config.ESP.Arrows and d.Arrow then
+        local spA, onA = cam:WorldToViewportPoint(root.Position)
+        local inScreen = onA and spA.Z > 0.35 and spA.X >= 10 and spA.X <= vp.X - 10 and spA.Y >= 10 and spA.Y <= vp.Y - 10
+        if inScreen then
+            d.Arrow.Visible = false
+            if d.ArrowOutline then d.ArrowOutline.Visible = false end
+        else
+            local lv = cam.CFrame:PointToObjectSpace(root.Position)
+            local fl = Vector2.new(lv.X, -lv.Y)
+            if fl.Magnitude < 0.001 then fl = Vector2.new(0, -1) end
+            local dir = fl.Unit
+            local perp = Vector2.new(-dir.Y, dir.X)
+            local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+            local tip = center + dir * math.min(vp.X, vp.Y) * 0.36
+            local bL = tip - dir * 13 + perp * 6.5
+            local bR = tip - dir * 13 - perp * 6.5
+            d._Cleared = false
+            if d.ArrowOutline then
+                d.ArrowOutline.PointA = tip + dir * 1.5
+                d.ArrowOutline.PointB = bL - dir * 1 + perp * 1.2
+                d.ArrowOutline.PointC = bR - dir * 1 - perp * 1.2
+                d.ArrowOutline.Visible = true
+            end
+            d.Arrow.PointA = tip
+            d.Arrow.PointB = bL
+            d.Arrow.PointC = bR
+            d.Arrow.Color = col
+            d.Arrow.Visible = true
+        end
+    else
+        if d.Arrow then d.Arrow.Visible = false end
+        if d.ArrowOutline then d.ArrowOutline.Visible = false end
+    end
+
+    local okBox, bx, by, bw, bh = computeBoxScreen(ch, root, cam, vp)
+    if not okBox then
+        hideEspDrawings(d, entry.Highlight, true)
+        return
+    end
+
+    updateCornerBox(d, Config.ESP.Box, bx, by, bw, bh, col)
+
+    local hpRatio = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+    if Config.ESP.HealthBar and d.HpBg and d.HpFill then
+        local barX = bx - 5
+        local fillH = math.max(math.floor(bh * hpRatio + 0.5), 1)
+        d.HpBg.Position = Vector2.new(barX - 1, by - 1)
+        d.HpBg.Size = Vector2.new(4, bh + 2)
+        d.HpBg.Visible = true
+        d.HpFill.Position = Vector2.new(barX, by + (bh - fillH))
+        d.HpFill.Size = Vector2.new(2, fillH)
+        d.HpFill.Color = computeHealthColor(hpRatio)
+        d.HpFill.Visible = true
+    else
+        if d.HpBg then d.HpBg.Visible = false end
+        if d.HpFill then d.HpFill.Visible = false end
+    end
+
+    local okMeta, lv, bountyStr, kenDodges, kenMax, heldName = pcall(BF.GetPlayerMeta, plr, ch)
+    local cx = math.floor(bx + bw * 0.5 + 0.5)
+    local fs = Config.Settings.FontSize
+
+    if Config.ESP.NameLevel and d.Name then
+        local prefix = (okMeta and lv) and string.format("[Lv.%d] ", lv) or ""
+        local lockTag = (ActiveLockPlayer == plr) and "★ " or ""
+        d.Name.Text = lockTag .. prefix .. plr.DisplayName
+        d.Name.Color = col
+        d.Name.Size = fs
+        d.Name.Position = Vector2.new(cx, by - fs - 3)
+        d.Name.Visible = true
+    elseif d.Name then
+        d.Name.Visible = false
+    end
+
+    local botLines: { { Text: string, Color: Color3 } } = {}
+    local l1Parts: { string } = {}
+    if Config.ESP.HealthText then
+        table.insert(l1Parts, string.format("%.0f HP", hum.Health))
+    end
+    if Config.ESP.Distance then
+        table.insert(l1Parts, string.format("%.0fm", dist))
+    end
+    if #l1Parts > 0 then
+        table.insert(botLines, { Text = table.concat(l1Parts, " · "), Color = Color3.fromRGB(226, 232, 240) })
+    end
+
+    if Config.ESP.BountyStatus and okMeta then
+        local stParts: { string } = {}
+        if bountyStr ~= "" then table.insert(stParts, bountyStr) end
+        if inSafe then table.insert(stParts, "SAFE") end
+        if kenDodges ~= nil then
+            table.insert(stParts, string.format("KEN %d/%d", kenDodges, kenMax or 8))
+        end
+        if #stParts > 0 then
+            table.insert(botLines, { Text = table.concat(stParts, " · "), Color = inSafe and THEME.SafeColor or Color3.fromRGB(250, 204, 21) })
+        end
+    end
+
+    if Config.ESP.WeaponFruit and okMeta and heldName then
+        table.insert(botLines, { Text = heldName, Color = Color3.fromRGB(165, 180, 252) })
+    end
+
+    local bLabels = { d.Bottom1, d.Bottom2, d.Bottom3 }
+    for idx, lbl in ipairs(bLabels) do
+        if lbl then
+            local info = botLines[idx]
+            if info then
+                lbl.Text = info.Text
+                lbl.Color = info.Color
+                lbl.Position = Vector2.new(cx, by + bh + 3 + (idx - 1) * (fs - 1))
+                lbl.Visible = true
+            else
+                lbl.Visible = false
+            end
+        end
+    end
+
+    if d.Tracer then
+        if Config.ESP.Tracers then
+            d.Tracer.From = Vector2.new(vp.X * 0.5, vp.Y)
+            d.Tracer.To = Vector2.new(cx, by + bh)
+            d.Tracer.Color = col
+            d.Tracer.Visible = true
+        else
+            d.Tracer.Visible = false
+        end
+    end
+
+    updateSkeleton(d, ch, cam, vp, col, Config.ESP.Skeleton)
+end
+
 pcall(RunService.UnbindFromRenderStep, RunService, "DeltaBFSilentESP")
 RunService:BindToRenderStep("DeltaBFSilentESP", Enum.RenderPriority.Last.Value, function()
     if not Session.IsAlive() then return end
@@ -2118,194 +2341,10 @@ RunService:BindToRenderStep("DeltaBFSilentESP", Enum.RenderPriority.Last.Value, 
 
     local camPos = cam.CFrame.Position
     for plr, entry in pairs(PlayerEsp) do
-        local ch = plr.Character
-        local alive, hum, root = BF.IsPlayerAlive(plr, ch)
-        if not Config.ESP.Enabled or not alive or not ch or not hum or not root then
+        local okEsp = pcall(renderPlayerEsp, plr, entry, cam, vp, camPos)
+        if not okEsp then
             hideEspDrawings(entry.Draw, entry.Highlight, false)
-            continue
         end
-
-        local isAlly = BF.IsAlly(plr)
-        if Config.ESP.TeamCheck and isAlly then
-            hideEspDrawings(entry.Draw, entry.Highlight, false)
-            continue
-        end
-        local inSafe = BF.IsPlayerInSafeZone(plr, ch)
-        if inSafe and not Config.ESP.ShowSafeZone then
-            hideEspDrawings(entry.Draw, entry.Highlight, false)
-            continue
-        end
-
-        local dist = (root.Position - camPos).Magnitude
-        if dist > Config.ESP.MaxDistance then
-            hideEspDrawings(entry.Draw, entry.Highlight, false)
-            continue
-        end
-
-        local col = Config.ESP.EnemyColor
-        if ActiveLockPlayer == plr then
-            col = Config.ESP.LockedColor
-        elseif isAlly then
-            col = Config.ESP.AllyColor
-        elseif inSafe then
-            col = Config.ESP.SafeColor
-        end
-
-        -- Highlight Chams
-        if Config.ESP.Highlights then
-            if not entry.Highlight or entry.Highlight.Parent ~= ch then
-                if entry.Highlight then pcall(function() entry.Highlight:Destroy() end) end
-                local hl = Instance.new("Highlight")
-                hl.Name = "__DeltaBFChams"
-                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                hl.FillTransparency = 0.65
-                hl.OutlineTransparency = 0.05
-                hl.Parent = ch
-                Session.Track(hl)
-                entry.Highlight = hl
-            end
-            entry.Highlight.FillColor = col
-            entry.Highlight.OutlineColor = Color3.new(1, 1, 1)
-            entry.Highlight.Enabled = true
-        elseif entry.Highlight then
-            entry.Highlight.Enabled = false
-        end
-
-        if not entry.Draw then
-            entry.Draw = createEspDrawings()
-        end
-        local d = entry.Draw :: { [string]: any }
-
-        -- Offscreen Arrow
-        if Config.ESP.Arrows and d.Arrow then
-            local spA, onA = cam:WorldToViewportPoint(root.Position)
-            local inScreen = onA and spA.Z > 0.35 and spA.X >= 10 and spA.X <= vp.X - 10 and spA.Y >= 10 and spA.Y <= vp.Y - 10
-            if inScreen then
-                d.Arrow.Visible = false
-                if d.ArrowOutline then d.ArrowOutline.Visible = false end
-            else
-                local lv = cam.CFrame:PointToObjectSpace(root.Position)
-                local fl = Vector2.new(lv.X, -lv.Y)
-                if fl.Magnitude < 0.001 then fl = Vector2.new(0, -1) end
-                local dir = fl.Unit
-                local perp = Vector2.new(-dir.Y, dir.X)
-                local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
-                local tip = center + dir * math.min(vp.X, vp.Y) * 0.36
-                local bL = tip - dir * 13 + perp * 6.5
-                local bR = tip - dir * 13 - perp * 6.5
-                d._Cleared = false
-                if d.ArrowOutline then
-                    d.ArrowOutline.PointA = tip + dir * 1.5
-                    d.ArrowOutline.PointB = bL - dir * 1 + perp * 1.2
-                    d.ArrowOutline.PointC = bR - dir * 1 - perp * 1.2
-                    d.ArrowOutline.Visible = true
-                end
-                d.Arrow.PointA = tip
-                d.Arrow.PointB = bL
-                d.Arrow.PointC = bR
-                d.Arrow.Color = col
-                d.Arrow.Visible = true
-            end
-        else
-            if d.Arrow then d.Arrow.Visible = false end
-            if d.ArrowOutline then d.ArrowOutline.Visible = false end
-        end
-
-        local okBox, bx, by, bw, bh = computeBoxScreen(ch, root, cam, vp)
-        if not okBox then
-            hideEspDrawings(d, entry.Highlight, true)
-            continue
-        end
-
-        updateCornerBox(d, Config.ESP.Box, bx, by, bw, bh, col)
-
-        local hpRatio = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-        if Config.ESP.HealthBar and d.HpBg and d.HpFill then
-            local barX = bx - 5
-            local fillH = math.max(math.floor(bh * hpRatio + 0.5), 1)
-            d.HpBg.Position = Vector2.new(barX - 1, by - 1)
-            d.HpBg.Size = Vector2.new(4, bh + 2)
-            d.HpBg.Visible = true
-            d.HpFill.Position = Vector2.new(barX, by + (bh - fillH))
-            d.HpFill.Size = Vector2.new(2, fillH)
-            d.HpFill.Color = computeHealthColor(hpRatio)
-            d.HpFill.Visible = true
-        else
-            if d.HpBg then d.HpBg.Visible = false end
-            if d.HpFill then d.HpFill.Visible = false end
-        end
-
-        local okMeta, lv, bountyStr, kenDodges, kenMax, heldName = pcall(BF.GetPlayerMeta, plr, ch)
-        local cx = math.floor(bx + bw * 0.5 + 0.5)
-        local fs = Config.Settings.FontSize
-
-        if Config.ESP.NameLevel and d.Name then
-            local prefix = (okMeta and lv) and string.format("[Lv.%d] ", lv) or ""
-            local lockTag = (ActiveLockPlayer == plr) and "★ " or ""
-            d.Name.Text = lockTag .. prefix .. plr.DisplayName
-            d.Name.Color = col
-            d.Name.Size = fs
-            d.Name.Position = Vector2.new(cx, by - fs - 3)
-            d.Name.Visible = true
-        elseif d.Name then
-            d.Name.Visible = false
-        end
-
-        local botLines: { { Text: string, Color: Color3 } } = {}
-        local l1Parts: { string } = {}
-        if Config.ESP.HealthText then
-            table.insert(l1Parts, string.format("%.0f HP", hum.Health))
-        end
-        if Config.ESP.Distance then
-            table.insert(l1Parts, string.format("%.0fm", dist))
-        end
-        if #l1Parts > 0 then
-            table.insert(botLines, { Text = table.concat(l1Parts, " · "), Color = Color3.fromRGB(226, 232, 240) })
-        end
-
-        if Config.ESP.BountyStatus and okMeta then
-            local stParts: { string } = {}
-            if bountyStr ~= "" then table.insert(stParts, bountyStr) end
-            if inSafe then table.insert(stParts, "SAFE") end
-            if kenDodges ~= nil then
-                table.insert(stParts, string.format("KEN %d/%d", kenDodges, kenMax or 8))
-            end
-            if #stParts > 0 then
-                table.insert(botLines, { Text = table.concat(stParts, " · "), Color = inSafe and THEME.SafeColor or Color3.fromRGB(250, 204, 21) })
-            end
-        end
-
-        if Config.ESP.WeaponFruit and okMeta and heldName then
-            table.insert(botLines, { Text = heldName, Color = Color3.fromRGB(165, 180, 252) })
-        end
-
-        local bLabels = { d.Bottom1, d.Bottom2, d.Bottom3 }
-        for idx, lbl in ipairs(bLabels) do
-            if lbl then
-                local info = botLines[idx]
-                if info then
-                    lbl.Text = info.Text
-                    lbl.Color = info.Color
-                    lbl.Position = Vector2.new(cx, by + bh + 3 + (idx - 1) * (fs - 1))
-                    lbl.Visible = true
-                else
-                    lbl.Visible = false
-                end
-            end
-        end
-
-        if d.Tracer then
-            if Config.ESP.Tracers then
-                d.Tracer.From = Vector2.new(vp.X * 0.5, vp.Y)
-                d.Tracer.To = Vector2.new(cx, by + bh)
-                d.Tracer.Color = col
-                d.Tracer.Visible = true
-            else
-                d.Tracer.Visible = false
-            end
-        end
-
-        updateSkeleton(d, ch, cam, vp, col, Config.ESP.Skeleton)
     end
 end)
 

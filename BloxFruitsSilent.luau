@@ -636,7 +636,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     local isNetGun = (iName == "RE/ShootGunEvent" or iName == "RemoteFunctionShoot")
     local eqTool = HookState.EquippedTool
     local isToolRemote = (eqTool ~= nil and eqTool.Parent == lpChar and selfInst:IsDescendantOf(eqTool))
-        and (iName == "RemoteEvent" or iName == "RemoteFunction" or iName == "LeftClickRemote" or iName == "RemoteFunctionShoot")
+        and (iName == "RemoteEvent" or iName == "LeftClickRemote" or iName == "RemoteFunctionShoot")
     local isCommE = (iName == "CommE")
     if not isNetGun and not isToolRemote and not isCommE then
         return false
@@ -672,7 +672,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     local changed = false
     local aimDir = (pred - rootPos)
     local aimUnit = aimDir.Magnitude > 0.01 and aimDir.Unit or Vector3.new(0, 0, -1)
-    local strictVec = (iName == "RemoteFunction" or isCommE)
+    local strictVec = isCommE
 
     for i = 1, n do
         local a = args[i]
@@ -680,7 +680,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
             if isTargetVectorArg(a, rawHit, rootPos, strictVec) then
                 args[i] = pred
                 changed = true
-            elseif (isNetGun or iName == "RemoteEvent" or iName == "LeftClickRemote") and math.abs(a.Magnitude - 1) <= 0.02 and rawHit then
+            elseif (isNetGun or iName == "LeftClickRemote") and math.abs(a.Magnitude - 1) <= 0.02 and rawHit then
                 local rawDir = (rawHit - rootPos)
                 if rawDir.Magnitude > 0.1 and a:Dot(rawDir.Unit) > 0.5 then
                     args[i] = aimUnit
@@ -688,15 +688,9 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
                 end
             end
         elseif typeof(a) == "CFrame" then
-            if rawHit and (a.Position - rawHit).Magnitude <= 95 then
+            if rawHit and (a.Position - rawHit).Magnitude <= 95 and (a.Position - rootPos).Magnitude > 14 then
                 args[i] = CFrame.lookAt(pred, pred + aimUnit)
                 changed = true
-            elseif (isNetGun or iName == "RemoteEvent") and (a.Position - rootPos).Magnitude <= 14 and rawHit then
-                local rawDir = (rawHit - a.Position)
-                if rawDir.Magnitude > 0.1 and a.LookVector:Dot(rawDir.Unit) > 0.5 then
-                    args[i] = CFrame.lookAt(a.Position, pred)
-                    changed = true
-                end
             end
         elseif type(a) == "table" and isNetGun then
             -- Hitscan / Gun shot arrays or hit info tables
@@ -746,80 +740,51 @@ local function clearRSMouseRawKeys()
 end
 clearRSMouseRawKeys()
 
-local function syncMouseTable(tbl: { [string]: any }?)
-    if not tbl or tbl == RSMouseTbl or not isSilentHookReady(false, true) then
-        return
-    end
-    local cf = getHookHitCFrame()
-    if cf then
-        rawset(tbl, "Hit", cf)
-    end
-    if HookState.TargetPart then
-        rawset(tbl, "Target", HookState.TargetPart)
-    end
-end
-
 HookState.ReadyFn = isSilentHookReady
 HookState.HitCFrameFn = getHookHitCFrame
-HookState.SyncTableFn = syncMouseTable
 HookState.ClearRSMouseFn = clearRSMouseRawKeys
 HookState.NativeRSMouse = NativeRSMouse
 HookState.NativeRSMouseHas = NativeRSMouseHas
+HookState.FromMouseFn = function(ctx: any): any
+    if type(ctx) == "table" and not ctx.mouse and type(ctx.aim) == "function" then
+        return ctx:aim(HookState.PredPos)
+    end
+    return HookState.PredPos
+end
 
 ;(function()
     local hasNewC = (type(newcclosure) == "function")
     local wrapC: (any) -> any = hasNewC and newcclosure or function(fn) return fn end
 
-    if (tonumber(rawget(Env, "__BFSilentWrapperHookVer")) or 0) < 5 then
-        Env.__BFSilentWrapperHookVer = 5
-
-        -- Hook Global.updateMouseWrapper so Blox Fruits' per-frame wrapper update writes Silent Hit/Target dynamically
+    -- Restore Global.updateMouseWrapper, WrapMouse & WrapMouse2 if an older version hooked them
+    -- (Hooking those ForeignState functions causes WrapMouse:68 "attempt to index nil with 'UserInputState'" on mouse move)
+    if type(restorefunction) == "function" then
         pcall(function()
             local gMod = ReplicatedStorage:FindFirstChild("Global")
-            if gMod and gMod:IsA("ModuleScript") and hookfunction then
+            if gMod and gMod:IsA("ModuleScript") then
                 local gTbl = require(gMod)
                 if type(gTbl) == "table" and type(gTbl.updateMouseWrapper) == "function" then
-                    local origUmw
-                    origUmw = hookfunction(gTbl.updateMouseWrapper, wrapC(function(tbl, ...)
-                        local res = table.pack(origUmw(tbl, ...))
-                        if type(tbl) == "table" and tbl ~= RSMouseTbl then
-                            local syncFn = HookState.SyncTableFn
-                            if syncFn then syncFn(tbl) end
-                        end
-                        local clrFn = HookState.ClearRSMouseFn
-                        if clrFn then clrFn() end
-                        return table.unpack(res, 1, res.n)
-                    end))
+                    if not isfunctionhooked or isfunctionhooked(gTbl.updateMouseWrapper) then
+                        pcall(restorefunction, gTbl.updateMouseWrapper)
+                    end
+                end
+            end
+            for _, wmName in ipairs({ "WrapMouse", "WrapMouse2" }) do
+                local wmMod = ReplicatedStorage:FindFirstChild(wmName)
+                if wmMod and wmMod:IsA("ModuleScript") then
+                    local wmFn = require(wmMod)
+                    if type(wmFn) == "function" and (not isfunctionhooked or isfunctionhooked(wmFn)) then
+                        pcall(restorefunction, wmFn)
+                    end
                 end
             end
         end)
-
-        -- Hook WrapMouse & WrapMouse2 (used by classic fruits/swords/styles)
-        for _, wmName in ipairs({ "WrapMouse", "WrapMouse2" }) do
-            pcall(function()
-                local wmMod = ReplicatedStorage:FindFirstChild(wmName)
-                if wmMod and wmMod:IsA("ModuleScript") and hookfunction then
-                    local wmFn = require(wmMod)
-                    if type(wmFn) == "function" then
-                        local origWm
-                        origWm = hookfunction(wmFn, wrapC(function(...)
-                            local tbl, disc = origWm(...)
-                            if type(tbl) == "table" and tbl ~= RSMouseTbl then
-                                local syncFn = HookState.SyncTableFn
-                                if syncFn then syncFn(tbl) end
-                            end
-                            return tbl, disc
-                        end))
-                    end
-                end
-            end)
-        end
     end
 
-    if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 3 then
+    if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 4 then
         return
     end
-    Env.__BFSilentCoreHookVer = 3
+    Env.__BFSilentCoreHookVer = 4
     Env.__BFSilentHooksInstalled = true
 
     local PlayerMouse: Mouse? = nil
@@ -861,7 +826,7 @@ HookState.NativeRSMouseHas = NativeRSMouseHas
                             local cfFn = HookState.HitCFrameFn
                             local cf = cfFn and cfFn()
                             if cf then return cf end
-                        elseif key == "Target" and HookState.TargetPart then
+                        elseif key == "Target" and HookState.TargetPart and HookState.ToolKind == "Gun" then
                             return HookState.TargetPart
                         elseif key == "Origin" then
                             local p = HookState.PredPos :: Vector3
@@ -885,7 +850,7 @@ HookState.NativeRSMouseHas = NativeRSMouseHas
         end
     end)
 
-    -- 2. MovesetUtil.Aim.fromMouse hook (reload-safe dynamic dispatch)
+    -- 2. MovesetUtil.Aim.fromMouse hook (reload-safe; calls ctx:aim when ctx.mouse is nil)
     pcall(function()
         local mu = ReplicatedStorage:FindFirstChild("MovesetUtil")
         local aimMod = mu and mu:FindFirstChild("Aim")
@@ -896,6 +861,10 @@ HookState.NativeRSMouseHas = NativeRSMouseHas
                 origFromMouse = hookfunction(aimTbl.fromMouse, wrapC(function(ctx)
                     local readyFn = HookState.ReadyFn
                     if readyFn and readyFn(false, true) and HookState.PredPos then
+                        local fmFn = HookState.FromMouseFn
+                        if fmFn then
+                            return fmFn(ctx)
+                        end
                         return HookState.PredPos
                     end
                     return origFromMouse(ctx)
@@ -950,7 +919,7 @@ HookState.NativeRSMouseHas = NativeRSMouseHas
                             local cfFn = HookState.HitCFrameFn
                             local cf = cfFn and cfFn()
                             if cf then return cf end
-                        elseif key == "Target" and HookState.TargetPart then
+                        elseif key == "Target" and HookState.TargetPart and HookState.ToolKind == "Gun" then
                             return HookState.TargetPart
                         elseif key == "Origin" then
                             local p = HookState.PredPos :: Vector3
@@ -978,7 +947,6 @@ HookState.NativeRSMouseHas = NativeRSMouseHas
                         if rName == "RE/ShootGunEvent"
                             or rName == "RemoteFunctionShoot"
                             or rName == "RemoteEvent"
-                            or rName == "RemoteFunction"
                             or rName == "LeftClickRemote"
                             or rName == "CommE"
                         then
@@ -1566,7 +1534,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v4.2"
+TitleLbl.Text = "DELTA · Blox Fruits v4.3"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header

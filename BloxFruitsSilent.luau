@@ -146,7 +146,7 @@ local Config = {
         Priority = "Crosshair", -- Crosshair | Closest | Lowest HP
         MaxDistance = 1500,
         UseFOV = true, -- Generous crosshair cone prevents hijacking NPCs/fruits behind you
-        FOV = 280,
+        FOV = 340,
         ShowFOV = false,
         ShowLeadLine = true,
         StickyLock = true,
@@ -1497,7 +1497,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits"
+TitleLbl.Text = "DELTA · Blox Fruits v4.1"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2067,6 +2067,17 @@ local COMBAT_KINDS: { [string]: boolean } = {
     Gun = true,
 }
 
+local NON_COMBAT_ITEM_PATTERNS = {
+    " fruit",
+    "compass",
+    "chalice",
+    "goblet",
+    "fishing rod",
+    "flower",
+    "present",
+    "gift",
+}
+
 local function classifyEquippedTool(ch: Model?): (boolean, Tool?, string)
     if not ch then
         return false, nil, ""
@@ -2079,23 +2090,32 @@ local function classifyEquippedTool(ch: Model?): (boolean, Tool?, string)
         return false, nil, ""
     end
     -- Physical uneaten Devil Fruits / utility items must NEVER be treated as combat silent-aim weapons
-    if tool:FindFirstChild("Eat") or tool:FindFirstChild("EatRemote") or tool:FindFirstChild("DropRemote") or tool:FindFirstChild("FruitModel") then
+    if tool:FindFirstChild("Eat") or tool:FindFirstChild("EatRemote") or tool:FindFirstChild("DropRemote") or tool:FindFirstChild("FruitModel") or tool:FindFirstChild("Store") then
         return false, tool, ""
     end
+    local nameLow = tool.Name:lower()
+    if nameLow == "fruit" or nameLow == "torch" or nameLow == "cup" or nameLow == "bait" then
+        return false, tool, ""
+    end
+    for _, pat in ipairs(NON_COMBAT_ITEM_PATTERNS) do
+        if nameLow:find(pat, 1, true) ~= nil then
+            return false, tool, ""
+        end
+    end
+
     local wType = tostring(tool:GetAttribute("WeaponType") or "")
     local tip = tostring(tool.ToolTip or "")
     local kind = COMBAT_KINDS[wType] and wType or (COMBAT_KINDS[tip] and tip or "")
-    local wNameAttr = tool:GetAttribute("WeaponName")
-    if kind ~= "" then
-        return true, tool, kind
+    if kind == "" then
+        if tool:FindFirstChild("RemoteFunctionShoot") ~= nil or nameLow:find("gun", 1, true) or nameLow:find("rifle", 1, true) or nameLow:find("guitar", 1, true) or nameLow:find("slingshot", 1, true) or nameLow:find("cannon", 1, true) or nameLow:find("bazooka", 1, true) or nameLow:find("kabucha", 1, true) or nameLow:find("bizarre", 1, true) or nameLow:find("flintlock", 1, true) or nameLow:find("musket", 1, true) or nameLow:find("acidum", 1, true) then
+            kind = "Gun"
+        elseif tool.Name:find("-", 1, true) ~= nil then
+            kind = "Blox Fruit"
+        else
+            kind = "Melee"
+        end
     end
-    if wNameAttr ~= nil or tool:FindFirstChild("LeftClickRemote") ~= nil then
-        return true, tool, (tip ~= "" and tip or "Melee")
-    end
-    if tool.Name:find("-", 1, true) ~= nil and not tool.Name:lower():find("fruit", 1, true) and tool:FindFirstChild("RemoteEvent") ~= nil then
-        return true, tool, "Blox Fruit"
-    end
-    return false, tool, ""
+    return true, tool, kind
 end
 
 local InteractRayParams = RaycastParams.new()
@@ -2106,44 +2126,47 @@ local function detectCursorAndNpcConflict(cam: Camera, aim2D: Vector2, origin3D:
         return true, math.huge, "Chat/Box"
     end
 
-    local rawMouse = UserInputService:GetMouseLocation()
-    if MenuVisible then
-        local mp, ms = MainWin.AbsolutePosition, MainWin.AbsoluteSize
-        if rawMouse.X >= mp.X and rawMouse.X <= mp.X + ms.X and rawMouse.Y >= mp.Y and rawMouse.Y <= mp.Y + ms.Y then
-            return true, math.huge, "Menu"
+    local isShiftLock = (UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter)
+    if not isShiftLock then
+        local rawMouse = UserInputService:GetMouseLocation()
+        if MenuVisible then
+            local mp, ms = MainWin.AbsolutePosition, MainWin.AbsoluteSize
+            if rawMouse.X >= mp.X and rawMouse.X <= mp.X + ms.X and rawMouse.Y >= mp.Y and rawMouse.Y <= mp.Y + ms.Y then
+                return true, math.huge, "Menu"
+            end
         end
-    end
 
-    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if pg then
-        local vpSize = cam.ViewportSize
-        local inset = GuiService:GetGuiInset()
-        local okG, objs = pcall(function()
-            return pg:GetGuiObjectsAtPosition(rawMouse.X - inset.X, rawMouse.Y - inset.Y)
-        end)
-        if okG and type(objs) == "table" then
-            for _, g in ipairs(objs) do
-                if not g:IsA("GuiObject") or not g.Visible then continue end
-                local sz = g.AbsoluteSize
-                if sz.X > vpSize.X * 0.55 and sz.Y > vpSize.Y * 0.55 then continue end
-                if (g:IsA("GuiButton") or g:IsA("TextBox")) and g.Active then
-                    local hasVisual = g.BackgroundTransparency < 0.98
-                        or (g:IsA("TextButton") and g.Text ~= "")
-                        or (g:IsA("TextBox") and g.Text ~= "")
-                        or (g:IsA("ImageButton") and g.Image ~= "")
-                    if hasVisual then
-                        return true, math.huge, "UI"
-                    end
-                elseif g.Active and g.BackgroundTransparency < 0.95 then
-                    local nm = g.Name:lower()
-                    if nm:find("dialog", 1, true)
-                        or nm:find("shop", 1, true)
-                        or nm:find("quest", 1, true)
-                        or nm:find("fruit", 1, true)
-                        or nm:find("menu", 1, true)
-                        or nm:find("prompt", 1, true)
-                    then
-                        return true, math.huge, "Dialogue/UI"
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if pg then
+            local vpSize = cam.ViewportSize
+            local inset = GuiService:GetGuiInset()
+            local okG, objs = pcall(function()
+                return pg:GetGuiObjectsAtPosition(rawMouse.X - inset.X, rawMouse.Y - inset.Y)
+            end)
+            if okG and type(objs) == "table" then
+                for _, g in ipairs(objs) do
+                    if not g:IsA("GuiObject") or not g.Visible then continue end
+                    local sz = g.AbsoluteSize
+                    if sz.X > vpSize.X * 0.55 and sz.Y > vpSize.Y * 0.55 then continue end
+                    if (g:IsA("GuiButton") or g:IsA("TextBox")) and g.Active then
+                        local hasVisual = g.BackgroundTransparency < 0.98
+                            or (g:IsA("TextButton") and g.Text ~= "")
+                            or (g:IsA("TextBox") and g.Text ~= "")
+                            or (g:IsA("ImageButton") and g.Image ~= "")
+                        if hasVisual then
+                            return true, math.huge, "UI"
+                        end
+                    elseif g.Active and g.BackgroundTransparency < 0.95 then
+                        local nm = g.Name:lower()
+                        if nm:find("dialog", 1, true)
+                            or nm:find("shop", 1, true)
+                            or nm:find("quest", 1, true)
+                            or nm:find("fruit", 1, true)
+                            or nm:find("menu", 1, true)
+                            or nm:find("prompt", 1, true)
+                        then
+                            return true, math.huge, "Dialogue/UI"
+                        end
                     end
                 end
             end
@@ -2385,7 +2408,10 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
             TargetStatusLbl.Text = string.format("Lock: %s (%dm)%s", targetPlr.DisplayName, distM, safeTxt)
             TargetStatusLbl.TextColor3 = THEME.Accent
         elseif silentOn then
-            if standbyReason ~= "" then
+            if standbyReason == "No Weapon" then
+                TargetStatusLbl.Text = "Silent: ACTIVE (Draw Weapon)"
+                TargetStatusLbl.TextColor3 = THEME.Success
+            elseif standbyReason ~= "" then
                 TargetStatusLbl.Text = string.format("Silent: Safe (%s)", standbyReason)
                 TargetStatusLbl.TextColor3 = THEME.AccentGlow
             else

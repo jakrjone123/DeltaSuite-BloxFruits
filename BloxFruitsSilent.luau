@@ -538,6 +538,7 @@ if type(HookState) ~= "table" then
         AllowMouseOverride = false,
         TargetDist = math.huge,
         RSMouseHooked = false,
+        RootPos = Vector3.zero,
         PredPos = nil :: Vector3?,
         TargetPart = nil :: BasePart?,
         ShotOrigin = Vector3.zero,
@@ -595,7 +596,8 @@ local function isTargetVectorArg(v: Vector3, rawHit: Vector3?, rootPos: Vector3,
         local dVec = v - rootPos
         local rVec = rawHit - rootPos
         if dVec.Magnitude >= 8 and rVec.Magnitude >= 8 then
-            if dVec.Unit:Dot(rVec.Unit) > 0.65 then
+            local du, ru = dVec.Unit, rVec.Unit
+            if (du.X * ru.X + du.Y * ru.Y + du.Z * ru.Z) > 0.65 then
                 return true
             end
         end
@@ -608,15 +610,29 @@ local function isAimCommECommand(cmd: string): boolean
     if low == "tap" or low == "z" or low == "x" or low == "c" or low == "v" then
         return true
     end
-    if low:find("mouse", 1, true)
-        or low:find("aim", 1, true)
-        or low:find("skill", 1, true)
-        or low:find("shoot", 1, true)
-        or low:find("fire", 1, true)
-        or low:find("cast", 1, true)
-        or low:find("release", 1, true)
+    if string.find(low, "mouse", 1, true)
+        or string.find(low, "aim", 1, true)
+        or string.find(low, "skill", 1, true)
+        or string.find(low, "shoot", 1, true)
+        or string.find(low, "fire", 1, true)
+        or string.find(low, "cast", 1, true)
+        or string.find(low, "release", 1, true)
     then
         return true
+    end
+    return false
+end
+
+local function isInstanceUnder(inst: Instance, ancestor: Instance): boolean
+    local cur = inst.Parent
+    while cur do
+        if rawequal(cur, ancestor) then
+            return true
+        end
+        if rawequal(cur, game) then
+            return false
+        end
+        cur = cur.Parent
     end
     return false
 end
@@ -635,7 +651,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     local iName = selfInst.Name
     local isNetGun = (iName == "RE/ShootGunEvent" or iName == "RemoteFunctionShoot")
     local eqTool = HookState.EquippedTool
-    local isToolRemote = (eqTool ~= nil and eqTool.Parent == lpChar and selfInst:IsDescendantOf(eqTool))
+    local isToolRemote = (eqTool ~= nil and eqTool.Parent == lpChar and isInstanceUnder(selfInst, eqTool))
         and (iName == "RemoteEvent" or iName == "LeftClickRemote" or iName == "RemoteFunctionShoot")
     local isCommE = (iName == "CommE")
     if not isNetGun and not isToolRemote and not isCommE then
@@ -655,7 +671,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
         return false
     end
 
-    -- CommE is strictly allowlisted so NPC, Fruit, Buso, Ken, Dash, Dialogue, Interaction events stay untouched
+    -- CommE is strictly allowlisted so NPC, Fruit, Buso, Ken, Dodge/Dash, Geppo, Soru, Dialogue stay 100% native
     if isCommE then
         if type(args[1]) == "string" then
             if not isAimCommECommand(args[1]) then
@@ -666,8 +682,10 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
         end
     end
 
-    local lpRoot = lpChar:FindFirstChild("HumanoidRootPart") :: BasePart?
-    local rootPos = lpRoot and lpRoot.Position or HookState.ShotOrigin
+    local rootPos = HookState.RootPos
+    if typeof(rootPos) ~= "Vector3" or rootPos == Vector3.zero then
+        rootPos = HookState.ShotOrigin
+    end
     local rawHit = HookState.RawMousePos
     local changed = false
     local aimDir = (pred - rootPos)
@@ -682,9 +700,12 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
                 changed = true
             elseif (isNetGun or iName == "LeftClickRemote") and math.abs(a.Magnitude - 1) <= 0.02 and rawHit then
                 local rawDir = (rawHit - rootPos)
-                if rawDir.Magnitude > 0.1 and a:Dot(rawDir.Unit) > 0.5 then
-                    args[i] = aimUnit
-                    changed = true
+                if rawDir.Magnitude > 0.1 then
+                    local ru = rawDir.Unit
+                    if (a.X * ru.X + a.Y * ru.Y + a.Z * ru.Z) > 0.5 then
+                        args[i] = aimUnit
+                        changed = true
+                    end
                 end
             end
         elseif typeof(a) == "CFrame" then
@@ -698,7 +719,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
                 if typeof(tv) == "Vector3" and isTargetVectorArg(tv, rawHit, rootPos, false) then
                     a[k] = pred
                     changed = true
-                elseif typeof(tv) == "Instance" and HookState.TargetPart and tv:IsDescendantOf(Workspace) and k == "Hit" then
+                elseif typeof(tv) == "Instance" and HookState.TargetPart and isInstanceUnder(tv, Workspace) and k == "Hit" then
                     a[k] = HookState.TargetPart
                     changed = true
                 end
@@ -781,10 +802,10 @@ end
         end)
     end
 
-    if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 4 then
+    if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 5 then
         return
     end
-    Env.__BFSilentCoreHookVer = 4
+    Env.__BFSilentCoreHookVer = 5
     Env.__BFSilentHooksInstalled = true
 
     local PlayerMouse: Mouse? = nil
@@ -935,15 +956,28 @@ end
         end
     end)
 
-    -- 5. game __namecall hook (pre-filters remote name before table.pack; never blocks NPC/Fruit/Interaction)
+    -- 5. game __namecall hook (ZERO OP_NAMECALL inside hook; never breaks Dash/Dodge/Skills)
     pcall(function()
         if hookmetamethod and checkcaller and getnamecallmethod and hasNewC then
+            local setNcm = (type(setnamecallmethod) == "function") and setnamecallmethod or nil
             local origNamecall
             origNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-                if not checkcaller() and HookState.Active and HookState.PredPos and HookState.HasCombatTool == true and HookState.AllowMouseOverride == true then
+                if not checkcaller() and typeof(self) == "Instance" and HookState.Active and HookState.PredPos and HookState.HasCombatTool == true and HookState.AllowMouseOverride == true then
                     local method = getnamecallmethod()
                     if method == "FireServer" or method == "InvokeServer" then
                         local rName = self.Name
+                        if rName == "CommE" then
+                            local a1 = select(1, ...)
+                            if type(a1) == "string" then
+                                if not isAimCommECommand(a1) then
+                                    if setNcm then setNcm(method) end
+                                    return origNamecall(self, ...)
+                                end
+                            elseif typeof(a1) ~= "Vector3" and typeof(a1) ~= "CFrame" then
+                                if setNcm then setNcm(method) end
+                                return origNamecall(self, ...)
+                            end
+                        end
                         if rName == "RE/ShootGunEvent"
                             or rName == "RemoteFunctionShoot"
                             or rName == "RemoteEvent"
@@ -953,11 +987,13 @@ end
                             local args = table.pack(...)
                             local redir = HookState.RedirectFn or redirectRemoteArgs
                             local okRedir, changed = pcall(redir, self, method, args, args.n)
+                            if setNcm then setNcm(method) end
                             if okRedir and changed then
                                 return origNamecall(self, table.unpack(args, 1, args.n))
                             end
                         end
                     end
+                    if setNcm then setNcm(method) end
                 end
                 return origNamecall(self, ...)
             end))
@@ -1534,7 +1570,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v4.3"
+TitleLbl.Text = "DELTA · Blox Fruits v4.4"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2356,6 +2392,7 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
     local lpAlive, _, lpRoot = BF.IsPlayerAlive(LocalPlayer, lpChar)
     local shotOrigin = lpRoot and (lpRoot.Position + Vector3.new(0, 1.4, 0)) or cam.CFrame.Position
 
+    HookState.RootPos = lpRoot and lpRoot.Position or cam.CFrame.Position
     HookState.ShotOrigin = shotOrigin
     HookState.RawMousePos = getRawMouseHitPos(cam)
     HookState.ApplySkills = Config.Silent.ApplySkills

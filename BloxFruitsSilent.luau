@@ -138,6 +138,8 @@ local Config = {
         Enabled = true,
         Key = Enum.KeyCode.Unknown :: BindValue, -- None needed (Always active by default)
         Mode = "Always", -- Always | Hold | Toggle
+        FocusOne = false, -- When ON, locks exclusively onto one chosen/pinned enemy
+        FocusKey = Enum.KeyCode.G :: BindValue, -- Press to pin/unpin single enemy under aim
         SafeInteract = true, -- Yields to NPCs, Fruits, ClickDetectors, Prompts & UI
         ApplySkills = true, -- Fruit / Sword / Melee MovesetV2 & Classic skills
         ApplyGunsM1 = true, -- Gun shots & M1 projectiles
@@ -154,17 +156,17 @@ local Config = {
         IgnoreSafeZone = true,
         HitChance = 100,
 
-        -- Strong 3D X / Y / Z Kinematic Prediction
+        -- Balanced 3D X / Y / Z Kinematic Prediction (tight & responsive, no wild overshoot)
         Prediction = true,
         AutoPing = true,
         AutoWeaponSpeed = true,
-        ProjSpeed = 380, -- studs/sec fallback for fruit/sword/melee skills
-        BaseLeadMs = 45, -- extra cast windup lead (ms)
-        PredX = 1.15,
-        PredY = 1.08,
-        PredZ = 1.15,
-        GravityCompY = true, -- Air drop / jump parabola + terrain ground clamp
-        AccelLead = true, -- Smooth EMA acceleration for dashes/curves
+        ProjSpeed = 620, -- studs/sec fallback for fruit skills
+        BaseLeadMs = 15, -- cast initiation lead (ms)
+        PredX = 1.00,
+        PredY = 0.90,
+        PredZ = 1.00,
+        GravityCompY = true, -- Gentle gravity curve (ignores Flying) + terrain ground clamp
+        AccelLead = true, -- Damped EMA acceleration (resets on direction reversals)
     },
     ESP = {
         Enabled = true,
@@ -344,20 +346,22 @@ function BF.GetActiveWeaponProjSpeed(): number
         local data = WeaponDataMod[wName] or WeaponDataMod[wName:lower():gsub("%s+", "")]
         if type(data) == "table" and data.WeaponType == "Gun" then
             if data.HitType == "Hitscan" then
-                return 2400
+                return 2600
             end
             local spd = tonumber(data.ProjectileSpeed or data.Speed or data.BulletSpeed)
             if spd and spd > 0 then
                 return spd
             end
             if wName:find("Skull") or wName:find("Soul") then
-                return 320
+                return 340
             end
         end
     end
     if wType == "Gun" then
-        if wName:lower():find("guitar") then return 320 end
-        return 1800
+        if wName:lower():find("guitar") then return 340 end
+        return 1900
+    elseif wType == "Melee" or wType == "Sword" then
+        return 900
     end
     return math.clamp(Config.Silent.ProjSpeed, 60, 3000)
 end
@@ -414,20 +418,37 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
     if posVel.Magnitude > 260 then
         posVel = rawAsmVel
     end
+    -- Snap cleanly to zero when target stops moving so stationary shots hit exact Chest
+    if rawAsmVel.Magnitude < 2.5 and posVel.Magnitude < 3.5 then
+        local decayVel = rec.SmoothedVel * math.max(0, 1 - dt * 18)
+        if decayVel.Magnitude < 1.8 then decayVel = Vector3.zero end
+        rec.SmoothedVel = decayVel
+        rec.PrevVel = decayVel
+        rec.Accel = Vector3.zero
+        rec.LastPos = curPos
+        rec.LastTime = now
+        return rec
+    end
+
     -- Blend AssemblyLinearVelocity with positional delta so CFrame dashes/skills track cleanly
     local blendedVel = (rawAsmVel.Magnitude > 2 and posVel.Magnitude > 2)
         and (rawAsmVel * 0.55 + posVel * 0.45)
         or (posVel.Magnitude > rawAsmVel.Magnitude and posVel or rawAsmVel)
 
-    local velAlpha = math.clamp(dt * 18, 0.25, 0.85)
+    local velAlpha = math.clamp(dt * 20, 0.28, 0.88)
     local nextVel = rec.SmoothedVel:Lerp(blendedVel, velAlpha)
     local rawAccel = (nextVel - rec.PrevVel) / math.max(dt, 0.016)
-    if rawAccel.Magnitude > 190 then
-        rawAccel = rawAccel.Unit * 190
+    if rawAccel.Magnitude > 90 then
+        rawAccel = rawAccel.Unit * 90
     end
-    local accAlpha = math.clamp(dt * 10, 0.15, 0.55)
 
-    rec.Accel = rec.Accel:Lerp(rawAccel, accAlpha)
+    -- Reset EMA acceleration on sharp direction reversals (strafe/dash turns) to prevent wild overshoot
+    if nextVel:Dot(rec.PrevVel) < 0 then
+        rec.Accel = Vector3.zero
+    else
+        local accAlpha = math.clamp(dt * 9, 0.12, 0.45)
+        rec.Accel = rec.Accel:Lerp(rawAccel, accAlpha)
+    end
     rec.PrevVel = nextVel
     rec.SmoothedVel = nextVel
     rec.LastPos = curPos
@@ -446,6 +467,9 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
     end
 
     local vel = sample.SmoothedVel
+    if vel.Magnitude < 1.8 then
+        return basePos
+    end
     local acc = Config.Silent.AccelLead and sample.Accel or Vector3.zero
 
     local pingSec = 0
@@ -454,10 +478,11 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
             return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
         end)
         if okPing and type(pingMs) == "number" then
-            pingSec = math.clamp(pingMs / 1000, 0.01, 0.45)
+            -- Data Ping in Roblox is RTT; ~0.60x RTT matches server arrival without over-leading
+            pingSec = math.clamp((pingMs * 0.60) / 1000, 0.01, 0.24)
         end
     end
-    local baseLeadSec = math.clamp(Config.Silent.BaseLeadMs / 1000, 0, 0.4)
+    local baseLeadSec = math.clamp(Config.Silent.BaseLeadMs / 1000, 0, 0.3)
     local projSpeed = BF.GetActiveWeaponProjSpeed()
 
     local sx = math.clamp(Config.Silent.PredX, 0, 2.5)
@@ -465,11 +490,15 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
     local sz = math.clamp(Config.Silent.PredZ, 0, 2.5)
 
     local hum = model:FindFirstChildOfClass("Humanoid")
-    local airborne = false
+    local falling, flying = false, false
     if hum then
         local okSt, hState = pcall(function() return hum:GetState() end)
-        if okSt and (hState == Enum.HumanoidStateType.Freefall or hState == Enum.HumanoidStateType.Jumping or hState == Enum.HumanoidStateType.Flying) then
-            airborne = true
+        if okSt then
+            if hState == Enum.HumanoidStateType.Flying then
+                flying = true
+            elseif (hState == Enum.HumanoidStateType.Freefall or hState == Enum.HumanoidStateType.Jumping) and vel.Y <= 12 then
+                falling = true
+            end
         end
     end
 
@@ -477,17 +506,19 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
     local predPos = basePos
 
     for _ = 1, 4 do
-        t = math.clamp(t, 0.01, 1.15)
-        local t2 = 0.5 * t * t
-        local dx = (vel.X * t + acc.X * t2) * sx
-        local dz = (vel.Z * t + acc.Z * t2) * sz
+        t = math.clamp(t, 0.01, 0.85)
+        local t2 = 0.25 * t * t
+        local axOff = math.clamp(acc.X * t2, -12, 12)
+        local azOff = math.clamp(acc.Z * t2, -12, 12)
+        local dx = (vel.X * t + axOff) * sx
+        local dz = (vel.Z * t + azOff) * sz
         local dy = vel.Y * t
 
-        if Config.Silent.GravityCompY and airborne then
-            local g = Workspace.Gravity * 0.55
-            dy = dy - g * t2
+        if Config.Silent.GravityCompY and falling and not flying then
+            local g = Workspace.Gravity * 0.28
+            dy = dy - g * (0.5 * t * t)
         else
-            dy = dy + acc.Y * t2 * 0.5
+            dy = dy + math.clamp(acc.Y * t2, -8, 8)
         end
         dy = dy * sy
 
@@ -516,8 +547,8 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
         return basePos
     end
     local leadVec = predPos - basePos
-    if leadVec.Magnitude > 140 then
-        predPos = basePos + leadVec.Unit * 140
+    if leadVec.Magnitude > 70 then
+        predPos = basePos + leadVec.Unit * 70
     end
 
     return predPos
@@ -589,7 +620,16 @@ local function isTargetVectorArg(v: Vector3, rawHit: Vector3?, rootPos: Vector3,
     if v.X ~= v.X or v.Y ~= v.Y or v.Z ~= v.Z then
         return false
     end
-    if rawHit and (v - rawHit).Magnitude <= 95 then
+    if rawHit and (v - rawHit).Magnitude <= 125 then
+        return true
+    end
+    local natTbl = HookState.NativeRSMouse
+    local natHit = natTbl and natTbl.Hit
+    if typeof(natHit) == "CFrame" and (v - natHit.Position).Magnitude <= 125 then
+        return true
+    end
+    local curPred = HookState.PredPos
+    if curPred and (v - curPred).Magnitude <= 35 then
         return true
     end
     if not strictMatch and rawHit then
@@ -597,7 +637,7 @@ local function isTargetVectorArg(v: Vector3, rawHit: Vector3?, rootPos: Vector3,
         local rVec = rawHit - rootPos
         if dVec.Magnitude >= 8 and rVec.Magnitude >= 8 then
             local du, ru = dVec.Unit, rVec.Unit
-            if (du.X * ru.X + du.Y * ru.Y + du.Z * ru.Z) > 0.65 then
+            if (du.X * ru.X + du.Y * ru.Y + du.Z * ru.Z) > 0.35 then
                 return true
             end
         end
@@ -1080,6 +1120,10 @@ type EspEntry = {
     Highlight: Highlight?,
 }
 
+local StickyTargetPlayer: Player? = nil
+local ActiveLockPlayer: Player? = nil
+local FocusedPlayer: Player? = nil
+
 local PlayerEsp: { [Player]: EspEntry } = {}
 
 local function createEspDrawings(): { [string]: any }
@@ -1163,6 +1207,9 @@ Session.Bind(Players.PlayerAdded, function(p: Player)
 end)
 Session.Bind(Players.PlayerRemoving, function(p: Player)
     MotionCache[p] = nil
+    if StickyTargetPlayer == p then StickyTargetPlayer = nil end
+    if ActiveLockPlayer == p then ActiveLockPlayer = nil end
+    if FocusedPlayer == p then FocusedPlayer = nil end
     local e = PlayerEsp[p]
     if e then
         destroyEspEntry(e)
@@ -1336,9 +1383,6 @@ local LeadDot = newDraw("Circle", { Filled = true, Radius = 3.2, NumSides = 16, 
 -- ============================================================================
 -- 6. TARGETING ENGINE & RUNTIME LOOP
 -- ============================================================================
-local StickyTargetPlayer: Player? = nil
-local ActiveLockPlayer: Player? = nil
-
 local function getAimOrigin2D(): Vector2
     local mouseLoc = UserInputService:GetMouseLocation()
     if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
@@ -1385,7 +1429,7 @@ local function pickAimPart(model: Model, origin2D: Vector2, cam: Camera): BasePa
         or model.PrimaryPart
 end
 
-local function evaluateSilentTarget(cam: Camera, origin3D: Vector3, aim2D: Vector2, now: number, onlyPlayer: Player?, fovMult: number?): (Player?, Model?, BasePart?, Vector3?, number, number)
+local function evaluateSilentTarget(cam: Camera, origin3D: Vector3, aim2D: Vector2, now: number, onlyPlayer: Player?, fovMult: number?, ignoreFovAndOffscreen: boolean?): (Player?, Model?, BasePart?, Vector3?, number, number)
     local bestP: Player? = nil
     local bestM: Model? = nil
     local bestPart: BasePart? = nil
@@ -1417,14 +1461,16 @@ local function evaluateSilentTarget(cam: Camera, origin3D: Vector3, aim2D: Vecto
 
         local sp, onScr = cam:WorldToViewportPoint(part.Position)
         local screenDist = (sp.Z > 0.35) and (Vector2.new(sp.X, sp.Y) - aim2D).Magnitude or math.huge
-        if useFov then
-            if sp.Z <= 0.35 or screenDist > fovLim then
-                continue
-            end
-        else
-            local offscreenCap = onlyPlayer and 550 or 260
-            if (sp.Z <= 0.35 or not onScr) and worldDist > offscreenCap then
-                continue
+        if not ignoreFovAndOffscreen then
+            if useFov then
+                if sp.Z <= 0.35 or screenDist > fovLim then
+                    continue
+                end
+            else
+                local offscreenCap = onlyPlayer and 550 or 260
+                if (sp.Z <= 0.35 or not onScr) and worldDist > offscreenCap then
+                    continue
+                end
             end
         end
 
@@ -1570,7 +1616,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v4.4"
+TitleLbl.Text = "DELTA · Blox Fruits v4.5"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2008,11 +2054,115 @@ end
 Session.Bind(TabSilentBtn.MouseButton1Click, function() selectTab("Silent") end)
 Session.Bind(TabEspBtn.MouseButton1Click, function() selectTab("ESP") end)
 
+local function refreshMenuUI()
+    for _, rf in ipairs(RefreshCallbacks) do
+        rf()
+    end
+end
+
 -- Populate Tab 1: SILENT (Core + Strong 3D X/Y/Z Prediction)
 local silentLeft = makeColumnCard(SilentPage, 0, "Silent Aim Core")
 addToggle(silentLeft, "Silent Aim", function() return Config.Silent.Enabled end, function(v) Config.Silent.Enabled = v end)
 addCycle(silentLeft, "Mode", { "Always", "Hold", "Toggle" }, function() return Config.Silent.Mode end, function(v) Config.Silent.Mode = v end)
 addKeybind(silentLeft, "Silent Key", function() return Config.Silent.Key end, function(k) Config.Silent.Key = k end)
+addToggle(silentLeft, "Focus 1 Enemy", function() return Config.Silent.FocusOne end, function(v)
+    Config.Silent.FocusOne = v
+    if not v then
+        FocusedPlayer = nil
+    end
+    refreshMenuUI()
+end)
+do
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 22)
+    row.BackgroundTransparency = 1
+    row.Parent = silentLeft
+
+    local txt = Instance.new("TextLabel")
+    txt.BackgroundTransparency = 1
+    txt.Position = UDim2.fromOffset(2, 0)
+    txt.Size = UDim2.new(0.48, 0, 1, 0)
+    txt.Font = Enum.Font.Gotham
+    txt.TextSize = 11
+    txt.TextColor3 = THEME.TextMuted
+    txt.TextXAlignment = Enum.TextXAlignment.Left
+    txt.Text = "Focus Target"
+    txt.Parent = row
+
+    local btn = Instance.new("TextButton")
+    btn.Position = UDim2.new(0.48, 2, 0.5, -9)
+    btn.Size = UDim2.new(0.52, -4, 0, 18)
+    btn.BackgroundColor3 = THEME.BgControl
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 10
+    btn.TextColor3 = THEME.TextPrimary
+    btn.TextTruncate = Enum.TextTruncate.AtEnd
+    btn.AutoButtonColor = false
+    btn.Parent = row
+    addCorner(btn, 4)
+    addStroke(btn, THEME.Border, 1, 0.45)
+
+    local function syncFocusBtn()
+        if FocusedPlayer and FocusedPlayer.Parent == Players then
+            btn.Text = FocusedPlayer.DisplayName
+            btn.TextColor3 = THEME.Accent
+        else
+            btn.Text = Config.Silent.FocusOne and "Auto (Next)" or "Auto"
+            btn.TextColor3 = Config.Silent.FocusOne and THEME.AccentGlow or THEME.TextPrimary
+        end
+    end
+    syncFocusBtn()
+    table.insert(RefreshCallbacks, syncFocusBtn)
+
+    Session.Bind(btn.MouseButton1Click, function()
+        local list: { Player } = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and not (Config.Silent.TeamCheck and BF.IsAlly(plr)) then
+                table.insert(list, plr)
+            end
+        end
+        table.sort(list, function(a, b)
+            return string.lower(a.DisplayName) < string.lower(b.DisplayName)
+        end)
+
+        if #list == 0 then
+            FocusedPlayer = nil
+            Config.Silent.FocusOne = false
+        elseif not FocusedPlayer or FocusedPlayer.Parent ~= Players then
+            FocusedPlayer = list[1]
+            Config.Silent.FocusOne = true
+            StickyTargetPlayer = FocusedPlayer
+        else
+            local idx: number? = nil
+            for i, p in ipairs(list) do
+                if p == FocusedPlayer then
+                    idx = i
+                    break
+                end
+            end
+            if idx and idx < #list then
+                FocusedPlayer = list[idx + 1]
+                Config.Silent.FocusOne = true
+                StickyTargetPlayer = FocusedPlayer
+            else
+                FocusedPlayer = nil
+                Config.Silent.FocusOne = false
+            end
+        end
+        refreshMenuUI()
+    end)
+
+    Session.Bind(btn.MouseButton2Click, function()
+        FocusedPlayer = nil
+        Config.Silent.FocusOne = false
+        refreshMenuUI()
+    end)
+
+    Session.Bind(Players.PlayerRemoving, function()
+        task.defer(syncFocusBtn)
+    end)
+end
+addKeybind(silentLeft, "Focus Key", function() return Config.Silent.FocusKey end, function(k) Config.Silent.FocusKey = k end)
 addToggle(silentLeft, "Safe NPC / Fruit", function() return Config.Silent.SafeInteract end, function(v) Config.Silent.SafeInteract = v end)
 addToggle(silentLeft, "Skills (Z/X/C/V)", function() return Config.Silent.ApplySkills end, function(v) Config.Silent.ApplySkills = v end)
 addToggle(silentLeft, "Guns & M1", function() return Config.Silent.ApplyGunsM1 end, function(v) Config.Silent.ApplyGunsM1 = v end)
@@ -2111,6 +2261,34 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
         if Config.Silent.Enabled and Config.Silent.Mode == "Toggle" then
             ToggleStates.Silent = not (ToggleStates.Silent ~= false)
         end
+    end
+
+    if (code ~= Enum.KeyCode.Unknown and code == Config.Silent.FocusKey)
+        or (inp.UserInputType ~= Enum.UserInputType.Keyboard and inp.UserInputType ~= Enum.UserInputType.MouseMovement and (Config.Silent.FocusKey :: any) == inp.UserInputType)
+    then
+        if Config.Silent.FocusOne then
+            Config.Silent.FocusOne = false
+            FocusedPlayer = nil
+            StickyTargetPlayer = nil
+        else
+            local picked: Player? = (ActiveLockPlayer and ActiveLockPlayer.Parent == Players) and ActiveLockPlayer or nil
+            if not picked then
+                local cam = Workspace.CurrentCamera
+                local ch = LocalPlayer.Character
+                local root = ch and ch:FindFirstChild("HumanoidRootPart") :: BasePart?
+                if cam and root then
+                    local aim2D = getAimOrigin2D()
+                    local p = evaluateSilentTarget(cam, root.Position, aim2D, os.clock(), nil, 1.5, true)
+                    picked = p
+                end
+            end
+            FocusedPlayer = picked
+            if picked then
+                StickyTargetPlayer = picked
+            end
+            Config.Silent.FocusOne = true
+        end
+        refreshMenuUI()
     end
     if isSilentHookReady(false, true) and HookState.PredPos and SKILL_KEYS[inp.KeyCode] then
         local nowK = os.clock()
@@ -2415,19 +2593,34 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
     local predPos: Vector3? = nil
     local targetScreenDist = math.huge
 
+    if Config.Silent.FocusOne and FocusedPlayer and FocusedPlayer.Parent ~= Players then
+        FocusedPlayer = nil
+        refreshMenuUI()
+    end
+
     local canLock = silentOn and lpAlive and hasCombatTool and not blockedInteract
     if canLock then
-        if Config.Silent.StickyLock and StickyTargetPlayer then
-            local p1, m1, pt1, pr1, _, sd1 = evaluateSilentTarget(cam, shotOrigin, aim2D, now, StickyTargetPlayer, 1.35)
+        if Config.Silent.FocusOne and FocusedPlayer then
+            local p1, m1, pt1, pr1, _, sd1 = evaluateSilentTarget(cam, shotOrigin, aim2D, now, FocusedPlayer, 1.0, true)
             targetPlr, targetModel, targetPart, predPos, targetScreenDist = p1, m1, pt1, pr1, sd1
-        end
-        if not targetPlr then
-            local p2, m2, pt2, pr2, _, sd2 = evaluateSilentTarget(cam, shotOrigin, aim2D, now, nil, 1.0)
-            targetPlr, targetModel, targetPart, predPos, targetScreenDist = p2, m2, pt2, pr2, sd2
+        else
+            if Config.Silent.StickyLock and StickyTargetPlayer then
+                local p1, m1, pt1, pr1, _, sd1 = evaluateSilentTarget(cam, shotOrigin, aim2D, now, StickyTargetPlayer, 1.35)
+                targetPlr, targetModel, targetPart, predPos, targetScreenDist = p1, m1, pt1, pr1, sd1
+            end
+            if not targetPlr then
+                local p2, m2, pt2, pr2, _, sd2 = evaluateSilentTarget(cam, shotOrigin, aim2D, now, nil, 1.0)
+                targetPlr, targetModel, targetPart, predPos, targetScreenDist = p2, m2, pt2, pr2, sd2
+            end
+            if Config.Silent.FocusOne and not FocusedPlayer and targetPlr then
+                FocusedPlayer = targetPlr
+                refreshMenuUI()
+            end
         end
 
         -- Yield to nearby NPC if player is actually aiming at that NPC rather than the enemy Player
-        if targetPlr and Config.Silent.SafeInteract and closestNpcDist <= 75 and closestNpcDist < (targetScreenDist * 0.85) then
+        local npcYieldPx = (Config.Silent.FocusOne and FocusedPlayer) and 38 or 75
+        if targetPlr and Config.Silent.SafeInteract and closestNpcDist <= npcYieldPx and closestNpcDist < (targetScreenDist * 0.85) then
             targetPlr, targetModel, targetPart, predPos = nil, nil, nil, nil
             blockReason = "NPC Aim"
         end
@@ -2527,10 +2720,23 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
         if targetPlr and predPos and lpRoot then
             local distM = math.floor((predPos - lpRoot.Position).Magnitude + 0.5)
             local safeTxt = (targetModel and BF.IsPlayerInSafeZone(targetPlr, targetModel)) and " [SAFE]" or ""
-            TargetStatusLbl.Text = string.format("Lock: %s (%dm)%s", targetPlr.DisplayName, distM, safeTxt)
-            TargetStatusLbl.TextColor3 = THEME.Accent
+            if Config.Silent.FocusOne and FocusedPlayer == targetPlr then
+                TargetStatusLbl.Text = string.format("FOCUS: %s (%dm)%s", targetPlr.DisplayName, distM, safeTxt)
+                TargetStatusLbl.TextColor3 = THEME.AccentGlow
+            else
+                TargetStatusLbl.Text = string.format("Lock: %s (%dm)%s", targetPlr.DisplayName, distM, safeTxt)
+                TargetStatusLbl.TextColor3 = THEME.Accent
+            end
         elseif silentOn then
-            if standbyReason == "No Weapon" then
+            if Config.Silent.FocusOne and FocusedPlayer and FocusedPlayer.Parent == Players then
+                if standbyReason == "No Weapon" then
+                    TargetStatusLbl.Text = string.format("FOCUS: %s (Draw Weapon)", FocusedPlayer.DisplayName)
+                    TargetStatusLbl.TextColor3 = THEME.Success
+                else
+                    TargetStatusLbl.Text = string.format("FOCUS: %s (Wait)", FocusedPlayer.DisplayName)
+                    TargetStatusLbl.TextColor3 = THEME.AccentGlow
+                end
+            elseif standbyReason == "No Weapon" then
                 TargetStatusLbl.Text = "Silent: ACTIVE (Draw Weapon)"
                 TargetStatusLbl.TextColor3 = THEME.Success
             elseif standbyReason ~= "" then
@@ -2574,7 +2780,7 @@ local function renderPlayerEsp(plr: Player, entry: EspEntry, cam: Camera, vp: Ve
     end
 
     local col = Config.ESP.EnemyColor
-    if ActiveLockPlayer == plr then
+    if ActiveLockPlayer == plr or (Config.Silent.FocusOne and FocusedPlayer == plr) then
         col = Config.ESP.LockedColor
     elseif isAlly then
         col = Config.ESP.AllyColor
@@ -2672,7 +2878,12 @@ local function renderPlayerEsp(plr: Player, entry: EspEntry, cam: Camera, vp: Ve
 
     if Config.ESP.NameLevel and d.Name then
         local prefix = (okMeta and lv) and string.format("[Lv.%d] ", lv) or ""
-        local lockTag = (ActiveLockPlayer == plr) and "★ " or ""
+        local lockTag = ""
+        if Config.Silent.FocusOne and FocusedPlayer == plr then
+            lockTag = "★ [FOCUS] "
+        elseif ActiveLockPlayer == plr then
+            lockTag = "★ "
+        end
         d.Name.Text = lockTag .. prefix .. plr.DisplayName
         d.Name.Color = col
         d.Name.Size = fs

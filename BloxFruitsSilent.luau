@@ -139,7 +139,7 @@ local Config = {
         Key = Enum.KeyCode.Unknown :: BindValue, -- None needed (Always active by default)
         Mode = "Always", -- Always | Hold | Toggle
         FocusOne = false, -- When ON, locks exclusively onto one chosen/pinned enemy
-        FocusKey = Enum.KeyCode.G :: BindValue, -- Press to pin/unpin single enemy under aim
+        FocusKey = Enum.KeyCode.U :: BindValue, -- Unused by Blox Fruits (avoids E/J/R/T/Y/G/Q ability keys)
         SafeInteract = true, -- Yields to NPCs, Fruits, ClickDetectors, Prompts & UI
         AutoBuso = true, -- Automatically activates Buso Haki (Aura) on execute & respawn
         ApplySkills = true, -- Fruit / Sword / Melee MovesetV2 & Classic skills
@@ -1003,45 +1003,28 @@ HookState.ToolKind = ""
 HookState.IsHitscanGunM1 = false
 HookState.AllowMouseOverride = false
 HookState.TargetDist = math.huge
+local ABILITY_BYPASS_KEYS: { [Enum.KeyCode]: boolean } = {
+    [Enum.KeyCode.E] = true, -- Ken / Observation Haki
+    [Enum.KeyCode.J] = true, -- Buso / Armament Haki
+    [Enum.KeyCode.R] = true, -- Soru / Flash Step (uses cursor position!)
+    [Enum.KeyCode.T] = true, -- Race V3 Ability
+    [Enum.KeyCode.Y] = true, -- Race V4 Awakening
+    [Enum.KeyCode.Q] = true, -- Dodge / Dash
+}
+
 local MyRunToken = (tonumber(HookState.RunToken) or 0) + 1
 HookState.RunToken = MyRunToken
-
--- Zero-latency sub-frame skill ballistics sync (runs BEFORE ContextActionService reads Mouse.Hit!)
-local function syncInstantSkillPrediction()
-    local curKey: string? = nil
-    for kc, kName in pairs(SKILL_KEYS) do
-        if UserInputService:IsKeyDown(kc) then
-            curKey = kName
-            break
-        end
-    end
-    if not curKey then
-        return
-    end
-    local now = os.clock()
-    Env.__BFActiveSkillKey = curKey
-    Env.__BFLastSkillTick = now
-    HookState.ActiveSkillKey = curKey
-    HookState.LastSkillTick = now
-    HookState.IsHitscanGunM1 = false
-    if HookState.PredComputedSkill ~= curKey then
-        local tPlr = HookState.TargetPlayer
-        local tMdl = HookState.TargetModel
-        local tPart = HookState.TargetPart
-        local tSample = tPlr and MotionCache[tPlr] or nil
-        if tPlr and tMdl and tPart and tSample and tPart.Parent then
-            HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
-            HookState.PredComputedSkill = curKey
-        end
-    end
-end
-HookState.SyncSkillPredFn = syncInstantSkillPrediction
+-- Explicitly clear any legacy sub-frame hook callback so zero OP_NAMECALL ever runs inside metamethods
+HookState.SyncSkillPredFn = nil
 
 local function isSilentHookReady(isGunRemote: boolean?, forMouse: boolean?): boolean
     if not Session.IsAlive() or not HookState.Active or HookState.PredPos == nil then
         return false
     end
     if HookState.HasCombatTool ~= true then
+        return false
+    end
+    if os.clock() < (tonumber(HookState.AbilityBypassUntil) or 0) then
         return false
     end
     if forMouse and HookState.AllowMouseOverride ~= true then
@@ -1054,10 +1037,6 @@ local function isSilentHookReady(isGunRemote: boolean?, forMouse: boolean?): boo
 end
 
 local function getEffectiveAimPos(preferHitscanForGun: boolean?): Vector3?
-    local syncFn = HookState.SyncSkillPredFn
-    if syncFn then
-        syncFn()
-    end
     if preferHitscanForGun and HookState.IsHitscanGunM1 and HookState.HitscanPos then
         return HookState.HitscanPos
     end
@@ -1166,29 +1145,35 @@ local function redirectNestedGunTable(tbl: { [any]: any }, depth: number, aimPos
 end
 
 local function isAllowedGunOrSkillRemoteName(rName: string): boolean
+    if rName == "CommE" or rName == "CommF_" then
+        return false
+    end
     return rName == "RE/ShootGunEvent"
         or rName == "RemoteFunctionShoot"
         or rName == "ShootFunction"
         or rName == "RemoteEvent"
         or rName == "LeftClickRemote"
         or rName == "RemoteFunction"
-        or rName == "CommE"
         or string.sub(rName, 1, 8) == "RE/Shoot"
         or string.sub(rName, 1, 8) == "RF/Shoot"
 end
 
 local function redirectRemoteArgs(selfInst: Instance, method: string, args: { any }, n: number): boolean
+    local iName = selfInst.Name
+    -- Never touch CommE or CommF_ (Ken, Buso, Haki, Soru, Geppo, Dodge, Race V3/V4, Quests/Shop)
+    if iName == "CommE" or iName == "CommF_" then
+        return false
+    end
     local pred = HookState.PredPos
     if not pred or not HookState.Active or HookState.HasCombatTool ~= true then
         return false
     end
-    if not HookState.AllowMouseOverride then
+    if not HookState.AllowMouseOverride or os.clock() < (tonumber(HookState.AbilityBypassUntil) or 0) then
         return false
     end
     local lpChar = LocalPlayer.Character
     if not lpChar then return false end
 
-    local iName = selfInst.Name
     local isNetGun = (iName == "RE/ShootGunEvent"
         or iName == "RemoteFunctionShoot"
         or iName == "ShootFunction"
@@ -1197,8 +1182,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     local eqTool = HookState.EquippedTool
     local isToolRemote = (eqTool ~= nil and eqTool.Parent == lpChar and isInstanceUnder(selfInst, eqTool))
         and (iName == "RemoteEvent" or iName == "LeftClickRemote" or iName == "RemoteFunctionShoot" or iName == "ShootFunction" or iName == "RemoteFunction")
-    local isCommE = (iName == "CommE")
-    if not isNetGun and not isToolRemote and not isCommE then
+    if not isNetGun and not isToolRemote then
         return false
     end
 
@@ -1215,17 +1199,6 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
         return false
     end
 
-    -- CommE is strictly allowlisted so NPC, Fruit, Buso, Ken, Dodge/Dash, Geppo, Soru, Dialogue stay 100% native
-    if isCommE then
-        if type(args[1]) == "string" then
-            if not isAimCommECommand(args[1]) then
-                return false
-            end
-        elseif typeof(args[1]) ~= "Vector3" and typeof(args[1]) ~= "CFrame" then
-            return false
-        end
-    end
-
     local aimPos = getEffectiveAimPos(true) or pred
     local rootPos = HookState.RootPos
     if typeof(rootPos) ~= "Vector3" or rootPos == Vector3.zero then
@@ -1235,7 +1208,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     local changed = false
     local aimDir = (aimPos - rootPos)
     local aimUnit = aimDir.Magnitude > 0.01 and aimDir.Unit or Vector3.new(0, 0, -1)
-    local strictVec = isCommE or (iName == "RemoteFunction")
+    local strictVec = (iName == "RemoteFunction")
 
     for i = 1, n do
         local a = args[i]
@@ -1357,9 +1330,10 @@ end
     end
 
     if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 7 then
+        Env.__BFSilentCoreHookVer = 8
         return
     end
-    Env.__BFSilentCoreHookVer = 7
+    Env.__BFSilentCoreHookVer = 8
     Env.__BFSilentHooksInstalled = true
 
     local PlayerMouse: Mouse? = nil
@@ -1562,7 +1536,7 @@ end
         end
     end)
 
-    -- 5. game __namecall hook (ZERO OP_NAMECALL inside hook; covers Gun remotes, ShootFunction & ViewportPointToRay)
+    -- 5. game __namecall hook (ZERO OP_NAMECALL inside hook; never touches CommE/CommF_ Haki/Ken/Buso/Soru/Dodge)
     pcall(function()
         if hookmetamethod and checkcaller and getnamecallmethod and hasNewC then
             local setNcm = (type(setnamecallmethod) == "function") and setnamecallmethod or nil
@@ -1573,35 +1547,29 @@ end
                     local method = getnamecallmethod()
                     if method == "FireServer" or method == "InvokeServer" then
                         local rName = self.Name
-                        if rName == "CommE" then
-                            local a1 = select(1, ...)
-                            if type(a1) == "string" then
-                                if not isAimCommECommand(a1) then
-                                    if setNcm then setNcm(method) end
-                                    return origNamecall(self, ...)
-                                end
-                            elseif typeof(a1) ~= "Vector3" and typeof(a1) ~= "CFrame" then
-                                if setNcm then setNcm(method) end
-                                return origNamecall(self, ...)
+                        if rName ~= "CommE" and rName ~= "CommF_" then
+                            local allowFn = HookState.RemoteAllowFn
+                            local allowed = false
+                            if allowFn then
+                                allowed = allowFn(rName)
+                            else
+                                allowed = (
+                                    rName == "RE/ShootGunEvent"
+                                    or rName == "RemoteFunctionShoot"
+                                    or rName == "ShootFunction"
+                                    or rName == "RemoteEvent"
+                                    or rName == "LeftClickRemote"
+                                    or rName == "RemoteFunction"
+                                )
                             end
-                        end
-                        local allowFn = HookState.RemoteAllowFn
-                        local allowed = allowFn and allowFn(rName) or (
-                            rName == "RE/ShootGunEvent"
-                            or rName == "RemoteFunctionShoot"
-                            or rName == "ShootFunction"
-                            or rName == "RemoteEvent"
-                            or rName == "LeftClickRemote"
-                            or rName == "RemoteFunction"
-                            or rName == "CommE"
-                        )
-                        if allowed then
-                            local args = table.pack(...)
-                            local redir = HookState.RedirectFn or redirectRemoteArgs
-                            local okRedir, changed = pcall(redir, self, method, args, args.n)
-                            if setNcm then setNcm(method) end
-                            if okRedir and changed then
-                                return origNamecall(self, table.unpack(args, 1, args.n))
+                            if allowed then
+                                local args = table.pack(...)
+                                local redir = HookState.RedirectFn or redirectRemoteArgs
+                                local okRedir, changed = pcall(redir, self, method, args, args.n)
+                                if setNcm then setNcm(method) end
+                                if okRedir and changed then
+                                    return origNamecall(self, table.unpack(args, 1, args.n))
+                                end
                             end
                         end
                     elseif method == "ViewportPointToRay" or method == "ScreenPointToRay" then
@@ -1636,7 +1604,6 @@ end
                             end
                         end
                     end
-                    if setNcm then setNcm(method) end
                 end
                 return origNamecall(self, ...)
             end))
@@ -2212,7 +2179,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v4.9"
+TitleLbl.Text = "DELTA · Blox Fruits v5.0"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2892,6 +2859,13 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
         end
         refreshMenuUI()
     end
+    if ABILITY_BYPASS_KEYS[inp.KeyCode] then
+        local nowAb = os.clock()
+        HookState.AbilityBypassUntil = nowAb + 0.30
+        if inp.KeyCode == Enum.KeyCode.J then
+            HookState.LastManualBusoTick = nowAb
+        end
+    end
     if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
         HookState.GunRayWindowUntil = os.clock() + 0.50
     end
@@ -2903,6 +2877,16 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
         HookState.LastSkillTick = nowSk
         Env.__BFLastSkillTick = nowSk
         HookState.GunRayWindowUntil = nowSk + 0.75
+        HookState.IsHitscanGunM1 = false
+        -- Event-driven ballistics refresh (safe outside metamethod hooks!)
+        local tPlr = HookState.TargetPlayer
+        local tMdl = HookState.TargetModel
+        local tPart = HookState.TargetPart
+        local tSample = tPlr and MotionCache[tPlr] or nil
+        if HookState.Active and tPlr and tMdl and tPart and tSample and tPart.Parent then
+            HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
+            HookState.PredComputedSkill = skPressed
+        end
         if isSilentHookReady(false, true) and HookState.PredPos then
             if nowSk - lastFaceSnapAt > 0.04 then
                 lastFaceSnapAt = nowSk
@@ -3034,8 +3018,15 @@ local function classifyEquippedTool(ch: Model?): (boolean, Tool?, string)
             kind = "Gun"
         elseif tool.Name:find("-", 1, true) ~= nil then
             kind = "Blox Fruit"
-        else
+        elseif tool:GetAttribute("MovesetV2") == true
+            or tool:FindFirstChild("MousePos") ~= nil
+            or tool:FindFirstChild("LeftClickRemote") ~= nil
+            or tool:FindFirstChild("RemoteEvent") ~= nil
+        then
             kind = "Melee"
+        else
+            -- Unidentified utility / Race / Haki / Quest item: leave 100% untouched
+            return false, tool, ""
         end
     end
     return true, tool, kind
@@ -3259,6 +3250,7 @@ end
 
 local lastBusoClock = -10
 local busoBusy = false
+local busoAttemptsThisLife = 0
 
 local function ensureBusoHaki(now: number, lpAlive: boolean, lpChar: Model?)
     if not Config.Silent.AutoBuso or not lpAlive or not lpChar or busoBusy then
@@ -3266,16 +3258,31 @@ local function ensureBusoHaki(now: number, lpAlive: boolean, lpChar: Model?)
     end
     if lpChar:FindFirstChild("HasBuso") ~= nil then
         HookState.ForceBusoNow = false
+        busoAttemptsThisLife = 0
         return
     end
     if not LocalPlayer.Team then
         return
     end
+    -- Respect manual J key press so user can toggle Buso without AutoBuso fighting them
+    if (now - (tonumber(HookState.LastManualBusoTick) or -99)) < 8.0 then
+        return
+    end
     if HookState.ForceBusoNow then
         HookState.ForceBusoNow = false
         lastBusoClock = -10
+        busoAttemptsThisLife = 0
     end
-    if (now - lastBusoClock) < 2.6 then
+    if busoAttemptsThisLife >= 3 or (now - lastBusoClock) < 4.5 then
+        return
+    end
+    -- Never invoke Buso mid-skill cast or while character is Busy / Stunned
+    local busyVal = lpChar:FindFirstChild("Busy")
+    if busyVal and busyVal:IsA("BoolValue") and busyVal.Value == true then
+        return
+    end
+    local stunVal = lpChar:FindFirstChild("Stun")
+    if stunVal and stunVal:IsA("NumberValue") and stunVal.Value > 0 then
         return
     end
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -3284,6 +3291,7 @@ local function ensureBusoHaki(now: number, lpAlive: boolean, lpChar: Model?)
         return
     end
     lastBusoClock = now
+    busoAttemptsThisLife += 1
     busoBusy = true
     task.spawn(function()
         pcall(function()
@@ -3296,9 +3304,14 @@ local function ensureBusoHaki(now: number, lpAlive: boolean, lpChar: Model?)
 end
 
 Session.Bind(LocalPlayer.CharacterAdded, function()
-    task.delay(0.45, function()
+    busoAttemptsThisLife = 0
+    -- Wait 1.8s so Blox Fruits server's native auto-Buso restore finishes first (prevents toggling it OFF!)
+    task.delay(1.8, function()
         if Session.IsAlive() and Config.Silent.AutoBuso then
-            HookState.ForceBusoNow = true
+            local ch = LocalPlayer.Character
+            if ch and ch:FindFirstChild("HasBuso") == nil then
+                HookState.ForceBusoNow = true
+            end
         end
     end)
 end)
@@ -3412,7 +3425,12 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
         chancePass = math.random(1, 100) <= Config.Silent.HitChance
     end
 
-    if canLock and predPos and targetPart and targetModel and chancePass then
+    if KeyHoldStates[Enum.KeyCode.R] == true then
+        HookState.AbilityBypassUntil = math.max(tonumber(HookState.AbilityBypassUntil) or 0, now + 0.15)
+    end
+    local abilityBypassing = now < (tonumber(HookState.AbilityBypassUntil) or 0)
+
+    if canLock and not abilityBypassing and predPos and targetPart and targetModel and chancePass then
         local liveHitPos = targetPart.Position
         local liveHitPart = targetPart
         local liveClear = false

@@ -141,6 +141,7 @@ local Config = {
         FocusOne = false, -- When ON, locks exclusively onto one chosen/pinned enemy
         FocusKey = Enum.KeyCode.G :: BindValue, -- Press to pin/unpin single enemy under aim
         SafeInteract = true, -- Yields to NPCs, Fruits, ClickDetectors, Prompts & UI
+        AutoBuso = true, -- Automatically activates Buso Haki (Aura) on execute & respawn
         ApplySkills = true, -- Fruit / Sword / Melee MovesetV2 & Classic skills
         ApplyGunsM1 = true, -- Gun shots & M1 projectiles
         AutoFaceCast = false, -- Optional yaw snap on skill keys (keep off for free movement)
@@ -1815,7 +1816,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v4.6"
+TitleLbl.Text = "DELTA · Blox Fruits v4.7"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2363,6 +2364,12 @@ do
 end
 addKeybind(silentLeft, "Focus Key", function() return Config.Silent.FocusKey end, function(k) Config.Silent.FocusKey = k end)
 addToggle(silentLeft, "Safe NPC / Fruit", function() return Config.Silent.SafeInteract end, function(v) Config.Silent.SafeInteract = v end)
+addToggle(silentLeft, "Auto Buso", function() return Config.Silent.AutoBuso end, function(v)
+    Config.Silent.AutoBuso = v
+    if v then
+        HookState.ForceBusoNow = true
+    end
+end)
 addToggle(silentLeft, "Skills (Z/X/C/V)", function() return Config.Silent.ApplySkills end, function(v) Config.Silent.ApplySkills = v end)
 addToggle(silentLeft, "Guns & M1", function() return Config.Silent.ApplyGunsM1 end, function(v) Config.Silent.ApplyGunsM1 = v end)
 addToggle(silentLeft, "Auto Face on Skill", function() return Config.Silent.AutoFaceCast end, function(v) Config.Silent.AutoFaceCast = v end)
@@ -2809,6 +2816,52 @@ local function resolveHitscanAimPos(origin: Vector3, targetModel: Model, primary
     return primaryPart.Position
 end
 
+local lastBusoClock = -10
+local busoBusy = false
+
+local function ensureBusoHaki(now: number, lpAlive: boolean, lpChar: Model?)
+    if not Config.Silent.AutoBuso or not lpAlive or not lpChar or busoBusy then
+        return
+    end
+    if lpChar:FindFirstChild("HasBuso") ~= nil then
+        HookState.ForceBusoNow = false
+        return
+    end
+    if not LocalPlayer.Team then
+        return
+    end
+    if HookState.ForceBusoNow then
+        HookState.ForceBusoNow = false
+        lastBusoClock = -10
+    end
+    if (now - lastBusoClock) < 2.6 then
+        return
+    end
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    if not commF or not commF:IsA("RemoteFunction") then
+        return
+    end
+    lastBusoClock = now
+    busoBusy = true
+    task.spawn(function()
+        pcall(function()
+            if Session.IsAlive() and Config.Silent.AutoBuso and lpChar.Parent and lpChar:FindFirstChild("HasBuso") == nil then
+                commF:InvokeServer("Buso")
+            end
+        end)
+        busoBusy = false
+    end)
+end
+
+Session.Bind(LocalPlayer.CharacterAdded, function()
+    task.delay(0.45, function()
+        if Session.IsAlive() and Config.Silent.AutoBuso then
+            HookState.ForceBusoNow = true
+        end
+    end)
+end)
+
 local lastStatsClock = 0
 local fpsFrames, fpsAcc = 0, 0
 local standbyReason = ""
@@ -2828,6 +2881,7 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
     local aim2D = getAimOrigin2D()
     local lpChar = LocalPlayer.Character
     local lpAlive, _, lpRoot = BF.IsPlayerAlive(LocalPlayer, lpChar)
+    ensureBusoHaki(now, lpAlive, lpChar)
     local shotOrigin = lpRoot and (lpRoot.Position + Vector3.new(0, 1.4, 0)) or cam.CFrame.Position
 
     HookState.RootPos = lpRoot and lpRoot.Position or cam.CFrame.Position

@@ -331,7 +331,58 @@ function BF.GetPlayerMeta(player: Player, model: Model?): (number?, string, numb
     return lv, bountyStr, kenDodges, kenMax, heldName
 end
 
-function BF.GetActiveWeaponProjSpeed(): number
+local WeaponDataNorm: { [string]: any } = {}
+if type(WeaponDataMod) == "table" then
+    for k, v in pairs(WeaponDataMod) do
+        if type(k) == "string" and type(v) == "table" then
+            WeaponDataNorm[k:lower():gsub("[%s%-_']", "")] = v
+        end
+    end
+end
+
+function BF.LookupWeaponData(tool: Tool?): ({ [string]: any }?, string, string)
+    if not tool then
+        return nil, "", ""
+    end
+    local wType = tostring(tool:GetAttribute("WeaponType") or tool.ToolTip or "")
+    local wName = tostring(tool:GetAttribute("WeaponName") or tool.Name or "")
+    if WeaponDataMod then
+        local data = WeaponDataMod[wName] or WeaponDataMod[tool.Name]
+        if type(data) ~= "table" then
+            data = WeaponDataNorm[wName:lower():gsub("[%s%-_']", "")]
+                or WeaponDataNorm[tool.Name:lower():gsub("[%s%-_']", "")]
+        end
+        if type(data) == "table" then
+            return data, wName, wType
+        end
+    end
+    return nil, wName, wType
+end
+
+local SKILL_KEYS = {
+    [Enum.KeyCode.Z] = true,
+    [Enum.KeyCode.X] = true,
+    [Enum.KeyCode.C] = true,
+    [Enum.KeyCode.V] = true,
+}
+
+local function isSkillInputActive(eqTool: Tool?, lastSkillTick: number): boolean
+    if (os.clock() - lastSkillTick) <= 0.65 then
+        return true
+    end
+    for kc in pairs(SKILL_KEYS) do
+        if UserInputService:IsKeyDown(kc) then
+            return true
+        end
+    end
+    local hObj = eqTool and eqTool:FindFirstChild("Holding")
+    if hObj and hObj:IsA("BoolValue") and hObj.Value == true then
+        return true
+    end
+    return false
+end
+
+function BF.GetActiveWeaponProjSpeed(usingSkill: boolean?): number
     if not Config.Silent.AutoWeaponSpeed then
         return math.clamp(Config.Silent.ProjSpeed, 60, 3000)
     end
@@ -340,35 +391,34 @@ function BF.GetActiveWeaponProjSpeed(): number
     if not tool then
         return math.clamp(Config.Silent.ProjSpeed, 60, 3000)
     end
-    local wType = tostring(tool:GetAttribute("WeaponType") or tool.ToolTip or "")
-    local wName = tostring(tool:GetAttribute("WeaponName") or tool.Name or "")
-    if WeaponDataMod then
-        local data = WeaponDataMod[wName] or WeaponDataMod[wName:lower():gsub("%s+", "")]
-        if type(data) == "table" and data.WeaponType == "Gun" then
-            if data.HitType == "Hitscan" then
-                return 2600
-            end
-            local spd = tonumber(data.ProjectileSpeed or data.Speed or data.BulletSpeed)
-            if spd and spd > 0 then
-                return spd
-            end
-            if wName:find("Skull") or wName:find("Soul") then
-                return 340
-            end
+    local data, wName, wType = BF.LookupWeaponData(tool)
+    if data and data.WeaponType == "Gun" then
+        if data.HitType == "Hitscan" then
+            return usingSkill and math.clamp(Config.Silent.ProjSpeed, 420, 950) or 2600
+        end
+        local spd = tonumber(data.ProjectileSpeed or data.Speed or data.BulletSpeed)
+        if spd and spd > 0 then
+            return spd
+        end
+        if wName:find("Skull") or wName:find("Soul") then
+            return 340
         end
     end
-    if wType == "Gun" then
+    if wType == "Gun" or (data and data.WeaponType == "Gun") then
         if wName:lower():find("guitar") then return 340 end
-        return 1900
+        return usingSkill and math.clamp(Config.Silent.ProjSpeed, 420, 950) or 1900
     elseif wType == "Melee" or wType == "Sword" then
         return 900
     end
     return math.clamp(Config.Silent.ProjSpeed, 60, 3000)
 end
 
--- Per-Player 3D (X, Y, Z) Velocity + Acceleration Tracker (Soru/TP spike-proof)
+-- Per-Player 3D (X, Y, Z) Network-Packet Velocity + Acceleration Tracker (Sawtooth & Soru Proof)
 type MotionSample = {
     LastPos: Vector3,
+    PacketPos: Vector3,
+    PacketTime: number,
+    PacketVel: Vector3,
     SmoothedVel: Vector3,
     PrevVel: Vector3,
     Accel: Vector3,
@@ -376,6 +426,8 @@ type MotionSample = {
     LastSoruTick: number,
 }
 local MotionCache: { [Player]: MotionSample } = {}
+local smoothedPingMs: number? = nil
+local lastPingClock = 0
 
 local function samplePlayerMotion(player: Player, model: Model, root: BasePart, now: number): MotionSample
     local curPos = root.Position
@@ -388,6 +440,9 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
     if not rec then
         rec = {
             LastPos = curPos,
+            PacketPos = curPos,
+            PacketTime = now,
+            PacketVel = rawAsmVel,
             SmoothedVel = rawAsmVel,
             PrevVel = rawAsmVel,
             Accel = Vector3.zero,
@@ -404,8 +459,11 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
     end
     local disp = curPos - rec.LastPos
     -- Reject teleport / Soru / respawn discontinuities
-    if disp.Magnitude > 48 or dt > 0.35 or soruTick ~= rec.LastSoruTick then
+    if disp.Magnitude > 52 or dt > 0.35 or soruTick ~= rec.LastSoruTick then
         rec.LastPos = curPos
+        rec.PacketPos = curPos
+        rec.PacketTime = now
+        rec.PacketVel = rawAsmVel
         rec.SmoothedVel = rawAsmVel
         rec.PrevVel = rawAsmVel
         rec.Accel = Vector3.zero
@@ -414,14 +472,23 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
         return rec
     end
 
-    local posVel = disp / dt
-    if posVel.Magnitude > 260 then
-        posVel = rawAsmVel
+    -- Measure displacement over real replication packet intervals to prevent 16ms/50ms 3x sawtooth spikes
+    local pDisp = curPos - rec.PacketPos
+    local pDt = now - rec.PacketTime
+    if pDisp.Magnitude >= 0.06 or pDt >= 0.085 then
+        local rawPVel = pDisp / math.max(pDt, 0.016)
+        if rawPVel.Magnitude <= 260 and rawPVel.X == rawPVel.X then
+            rec.PacketVel = rawPVel
+        end
+        rec.PacketPos = curPos
+        rec.PacketTime = now
     end
-    -- Snap cleanly to zero when target stops moving so stationary shots hit exact Chest
-    if rawAsmVel.Magnitude < 2.5 and posVel.Magnitude < 3.5 then
-        local decayVel = rec.SmoothedVel * math.max(0, 1 - dt * 18)
-        if decayVel.Magnitude < 1.8 then decayVel = Vector3.zero end
+
+    local pkVel = rec.PacketVel
+    -- Snap cleanly to zero when target stops moving so stationary shots hit dead-center Chest
+    if rawAsmVel.Magnitude < 2.2 and pkVel.Magnitude < 2.5 then
+        local decayVel = rec.SmoothedVel * math.max(0, 1 - dt * 22)
+        if decayVel.Magnitude < 1.5 then decayVel = Vector3.zero end
         rec.SmoothedVel = decayVel
         rec.PrevVel = decayVel
         rec.Accel = Vector3.zero
@@ -430,23 +497,39 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
         return rec
     end
 
-    -- Blend AssemblyLinearVelocity with positional delta so CFrame dashes/skills track cleanly
-    local blendedVel = (rawAsmVel.Magnitude > 2 and posVel.Magnitude > 2)
-        and (rawAsmVel * 0.55 + posVel * 0.45)
-        or (posVel.Magnitude > rawAsmVel.Magnitude and posVel or rawAsmVel)
-
-    local velAlpha = math.clamp(dt * 20, 0.28, 0.88)
-    local nextVel = rec.SmoothedVel:Lerp(blendedVel, velAlpha)
-    local rawAccel = (nextVel - rec.PrevVel) / math.max(dt, 0.016)
-    if rawAccel.Magnitude > 90 then
-        rawAccel = rawAccel.Unit * 90
+    -- Fuse AssemblyLinearVelocity and PacketVel cleanly
+    local blendedVel: Vector3
+    if rawAsmVel.Magnitude > 2.2 and pkVel.Magnitude > 2.2 then
+        if rawAsmVel:Dot(pkVel) > 0 then
+            blendedVel = rawAsmVel * 0.58 + pkVel * 0.42
+        else
+            blendedVel = rawAsmVel * 0.25 + pkVel * 0.75
+        end
+    else
+        blendedVel = (pkVel.Magnitude > rawAsmVel.Magnitude) and pkVel or rawAsmVel
     end
 
-    -- Reset EMA acceleration on sharp direction reversals (strafe/dash turns) to prevent wild overshoot
-    if nextVel:Dot(rec.PrevVel) < 0 then
+    local flatMag = Vector2.new(blendedVel.X, blendedVel.Z).Magnitude
+    if flatMag > 210 then
+        local sc = 210 / flatMag
+        blendedVel = Vector3.new(blendedVel.X * sc, blendedVel.Y, blendedVel.Z * sc)
+    end
+    blendedVel = Vector3.new(blendedVel.X, math.clamp(blendedVel.Y, -165, 165), blendedVel.Z)
+
+    local velAlpha = math.clamp(dt * 22, 0.28, 0.90)
+    local nextVel = rec.SmoothedVel:Lerp(blendedVel, velAlpha)
+    local rawAccel = (nextVel - rec.PrevVel) / math.max(dt, 0.016)
+    if rawAccel.Magnitude > 80 then
+        rawAccel = rawAccel.Unit * 80
+    end
+
+    -- Reset EMA acceleration on sharp turns (> ~50 deg) or sudden deceleration to prevent wild overshoot
+    local mNext, mPrev = nextVel.Magnitude, rec.PrevVel.Magnitude
+    local aligned = (mNext > 1 and mPrev > 1) and (nextVel:Dot(rec.PrevVel) > mNext * mPrev * 0.65) or false
+    if not aligned or mNext < mPrev * 0.85 then
         rec.Accel = Vector3.zero
     else
-        local accAlpha = math.clamp(dt * 9, 0.12, 0.45)
+        local accAlpha = math.clamp(dt * 8, 0.10, 0.38)
         rec.Accel = rec.Accel:Lerp(rawAccel, accAlpha)
     end
     rec.PrevVel = nextVel
@@ -460,65 +543,82 @@ local GroundRayParams = RaycastParams.new()
 GroundRayParams.FilterType = Enum.RaycastFilterType.Exclude
 GroundRayParams.IgnoreWater = false
 
-function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, origin: Vector3, sample: MotionSample): Vector3
+function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, origin: Vector3, sample: MotionSample, forceSpeed: number?): Vector3
     local basePos = aimPart.Position
     if not Config.Silent.Prediction then
         return basePos
     end
 
     local vel = sample.SmoothedVel
-    if vel.Magnitude < 1.8 then
+    if vel.Magnitude < 1.5 then
         return basePos
     end
     local acc = Config.Silent.AccelLead and sample.Accel or Vector3.zero
 
     local pingSec = 0
     if Config.Silent.AutoPing then
+        local nowClk = os.clock()
+        local dtPing = math.max(nowClk - lastPingClock, 0.008)
+        lastPingClock = nowClk
         local okPing, pingMs = pcall(function()
             return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
         end)
-        if okPing and type(pingMs) == "number" then
-            -- Data Ping in Roblox is RTT; ~0.60x RTT matches server arrival without over-leading
-            pingSec = math.clamp((pingMs * 0.60) / 1000, 0.01, 0.24)
+        if okPing and type(pingMs) == "number" and pingMs == pingMs then
+            local clamped = math.clamp(pingMs, 10, 480)
+            if not smoothedPingMs then
+                smoothedPingMs = clamped
+            else
+                local pAlpha = math.clamp(dtPing * 6, 0.06, 0.35)
+                smoothedPingMs = (smoothedPingMs :: number) + (clamped - (smoothedPingMs :: number)) * pAlpha
+            end
+            -- Data Ping in Roblox is RTT; ~0.55x smoothed RTT models server arrival without jitter
+            pingSec = math.clamp(((smoothedPingMs :: number) * 0.55) / 1000, 0.008, 0.22)
+        elseif smoothedPingMs then
+            pingSec = math.clamp(((smoothedPingMs :: number) * 0.55) / 1000, 0.008, 0.22)
         end
     end
     local baseLeadSec = math.clamp(Config.Silent.BaseLeadMs / 1000, 0, 0.3)
-    local projSpeed = BF.GetActiveWeaponProjSpeed()
+    local curTool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+    local usingSkill = isSkillInputActive(curTool, tonumber(rawget(Env, "__BFLastSkillTick")) or 0)
+    local projSpeed = forceSpeed or BF.GetActiveWeaponProjSpeed(usingSkill)
 
     local sx = math.clamp(Config.Silent.PredX, 0, 2.5)
     local sy = math.clamp(Config.Silent.PredY, 0, 2.5)
     local sz = math.clamp(Config.Silent.PredZ, 0, 2.5)
 
     local hum = model:FindFirstChildOfClass("Humanoid")
-    local falling, flying = false, false
+    local airborne, flying = false, false
     if hum then
         local okSt, hState = pcall(function() return hum:GetState() end)
         if okSt then
-            if hState == Enum.HumanoidStateType.Flying then
+            if hState == Enum.HumanoidStateType.Flying or hState == Enum.HumanoidStateType.Swimming then
                 flying = true
-            elseif (hState == Enum.HumanoidStateType.Freefall or hState == Enum.HumanoidStateType.Jumping) and vel.Y <= 12 then
-                falling = true
+            elseif hState == Enum.HumanoidStateType.Freefall or hState == Enum.HumanoidStateType.Jumping then
+                airborne = true
             end
         end
+    end
+    if not airborne and not flying and math.abs(vel.Y) > 6 then
+        airborne = true
     end
 
     local t = pingSec + baseLeadSec + (basePos - origin).Magnitude / math.max(projSpeed, 60)
     local predPos = basePos
 
-    for _ = 1, 4 do
-        t = math.clamp(t, 0.01, 0.85)
-        local t2 = 0.25 * t * t
-        local axOff = math.clamp(acc.X * t2, -12, 12)
-        local azOff = math.clamp(acc.Z * t2, -12, 12)
+    for _ = 1, 5 do
+        t = math.clamp(t, 0.008, 0.68)
+        local t2 = 0.22 * t * t
+        local axOff = math.clamp(acc.X * t2, -10, 10)
+        local azOff = math.clamp(acc.Z * t2, -10, 10)
         local dx = (vel.X * t + axOff) * sx
         local dz = (vel.Z * t + azOff) * sz
         local dy = vel.Y * t
 
-        if Config.Silent.GravityCompY and falling and not flying then
-            local g = Workspace.Gravity * 0.28
+        if Config.Silent.GravityCompY and airborne and not flying then
+            local g = Workspace.Gravity * 0.42
             dy = dy - g * (0.5 * t * t)
         else
-            dy = dy + math.clamp(acc.Y * t2, -8, 8)
+            dy = dy + math.clamp(acc.Y * t2, -7, 7)
         end
         dy = dy * sy
 
@@ -547,8 +647,8 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
         return basePos
     end
     local leadVec = predPos - basePos
-    if leadVec.Magnitude > 70 then
-        predPos = basePos + leadVec.Unit * 70
+    if leadVec.Magnitude > 68 then
+        predPos = basePos + leadVec.Unit * 68
     end
 
     return predPos
@@ -566,11 +666,15 @@ if type(HookState) ~= "table" then
         HasCombatTool = false,
         EquippedTool = nil :: Tool?,
         ToolKind = "",
+        IsHitscanGunM1 = false,
+        LastSkillTick = 0,
+        GunRayWindowUntil = 0,
         AllowMouseOverride = false,
         TargetDist = math.huge,
         RSMouseHooked = false,
         RootPos = Vector3.zero,
         PredPos = nil :: Vector3?,
+        HitscanPos = nil :: Vector3?,
         TargetPart = nil :: BasePart?,
         ShotOrigin = Vector3.zero,
         ScreenPos = Vector2.zero,
@@ -580,10 +684,12 @@ if type(HookState) ~= "table" then
 end
 HookState.Active = false
 HookState.PredPos = nil
+HookState.HitscanPos = nil
 HookState.TargetPart = nil
 HookState.HasCombatTool = false
 HookState.EquippedTool = nil
 HookState.ToolKind = ""
+HookState.IsHitscanGunM1 = false
 HookState.AllowMouseOverride = false
 HookState.TargetDist = math.huge
 local MyRunToken = (tonumber(HookState.RunToken) or 0) + 1
@@ -599,14 +705,21 @@ local function isSilentHookReady(isGunRemote: boolean?, forMouse: boolean?): boo
     if forMouse and HookState.AllowMouseOverride ~= true then
         return false
     end
-    if isGunRemote then
+    if isGunRemote or HookState.ToolKind == "Gun" then
         return HookState.ApplyGuns == true
     end
     return HookState.ApplySkills == true
 end
 
+local function getEffectiveAimPos(preferHitscanForGun: boolean?): Vector3?
+    if preferHitscanForGun and HookState.IsHitscanGunM1 and HookState.HitscanPos then
+        return HookState.HitscanPos
+    end
+    return HookState.PredPos
+end
+
 local function getHookHitCFrame(): CFrame?
-    local pos = HookState.PredPos
+    local pos = getEffectiveAimPos(true)
     if not pos then return nil end
     local org = HookState.ShotOrigin
     local dir = pos - org
@@ -620,6 +733,10 @@ local function isTargetVectorArg(v: Vector3, rawHit: Vector3?, rootPos: Vector3,
     if v.X ~= v.X or v.Y ~= v.Y or v.Z ~= v.Z then
         return false
     end
+    -- Protect muzzle/caster origin vectors near local character from being overwritten
+    if (tonumber(HookState.TargetDist) or math.huge) > 12 and (v - rootPos).Magnitude <= 10 then
+        return false
+    end
     if rawHit and (v - rawHit).Magnitude <= 125 then
         return true
     end
@@ -630,6 +747,10 @@ local function isTargetVectorArg(v: Vector3, rawHit: Vector3?, rootPos: Vector3,
     end
     local curPred = HookState.PredPos
     if curPred and (v - curPred).Magnitude <= 35 then
+        return true
+    end
+    local curHitscan = HookState.HitscanPos
+    if curHitscan and (v - curHitscan).Magnitude <= 28 then
         return true
     end
     if not strictMatch and rawHit then
@@ -677,6 +798,39 @@ local function isInstanceUnder(inst: Instance, ancestor: Instance): boolean
     return false
 end
 
+local function redirectNestedGunTable(tbl: { [any]: any }, depth: number, aimPos: Vector3, rawHit: Vector3?, rootPos: Vector3): boolean
+    if depth > 3 then
+        return false
+    end
+    local changed = false
+    for k, tv in pairs(tbl) do
+        if typeof(tv) == "Vector3" and isTargetVectorArg(tv, rawHit, rootPos, false) then
+            tbl[k] = aimPos
+            changed = true
+        elseif typeof(tv) == "Instance" and HookState.TargetPart and k == "Hit" and isInstanceUnder(tv, Workspace) then
+            tbl[k] = HookState.TargetPart
+            changed = true
+        elseif type(tv) == "table" then
+            if redirectNestedGunTable(tv, depth + 1, aimPos, rawHit, rootPos) then
+                changed = true
+            end
+        end
+    end
+    return changed
+end
+
+local function isAllowedGunOrSkillRemoteName(rName: string): boolean
+    return rName == "RE/ShootGunEvent"
+        or rName == "RemoteFunctionShoot"
+        or rName == "ShootFunction"
+        or rName == "RemoteEvent"
+        or rName == "LeftClickRemote"
+        or rName == "RemoteFunction"
+        or rName == "CommE"
+        or string.sub(rName, 1, 8) == "RE/Shoot"
+        or string.sub(rName, 1, 8) == "RF/Shoot"
+end
+
 local function redirectRemoteArgs(selfInst: Instance, method: string, args: { any }, n: number): boolean
     local pred = HookState.PredPos
     if not pred or not HookState.Active or HookState.HasCombatTool ~= true then
@@ -689,10 +843,14 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     if not lpChar then return false end
 
     local iName = selfInst.Name
-    local isNetGun = (iName == "RE/ShootGunEvent" or iName == "RemoteFunctionShoot")
+    local isNetGun = (iName == "RE/ShootGunEvent"
+        or iName == "RemoteFunctionShoot"
+        or iName == "ShootFunction"
+        or string.sub(iName, 1, 8) == "RE/Shoot"
+        or string.sub(iName, 1, 8) == "RF/Shoot")
     local eqTool = HookState.EquippedTool
     local isToolRemote = (eqTool ~= nil and eqTool.Parent == lpChar and isInstanceUnder(selfInst, eqTool))
-        and (iName == "RemoteEvent" or iName == "LeftClickRemote" or iName == "RemoteFunctionShoot")
+        and (iName == "RemoteEvent" or iName == "LeftClickRemote" or iName == "RemoteFunctionShoot" or iName == "ShootFunction" or iName == "RemoteFunction")
     local isCommE = (iName == "CommE")
     if not isNetGun and not isToolRemote and not isCommE then
         return false
@@ -707,7 +865,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
         if (tonumber(HookState.TargetDist) or math.huge) > maxM1Dist then
             return false
         end
-    elseif not isSilentHookReady(isNetGun, true) then
+    elseif not isSilentHookReady(isNetGun or HookState.ToolKind == "Gun", true) then
         return false
     end
 
@@ -722,21 +880,22 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
         end
     end
 
+    local aimPos = getEffectiveAimPos(true) or pred
     local rootPos = HookState.RootPos
     if typeof(rootPos) ~= "Vector3" or rootPos == Vector3.zero then
         rootPos = HookState.ShotOrigin
     end
     local rawHit = HookState.RawMousePos
     local changed = false
-    local aimDir = (pred - rootPos)
+    local aimDir = (aimPos - rootPos)
     local aimUnit = aimDir.Magnitude > 0.01 and aimDir.Unit or Vector3.new(0, 0, -1)
-    local strictVec = isCommE
+    local strictVec = isCommE or (iName == "RemoteFunction")
 
     for i = 1, n do
         local a = args[i]
         if typeof(a) == "Vector3" then
             if isTargetVectorArg(a, rawHit, rootPos, strictVec) then
-                args[i] = pred
+                args[i] = aimPos
                 changed = true
             elseif (isNetGun or iName == "LeftClickRemote") and math.abs(a.Magnitude - 1) <= 0.02 and rawHit then
                 local rawDir = (rawHit - rootPos)
@@ -749,26 +908,20 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
                 end
             end
         elseif typeof(a) == "CFrame" then
-            if rawHit and (a.Position - rawHit).Magnitude <= 95 and (a.Position - rootPos).Magnitude > 14 then
-                args[i] = CFrame.lookAt(pred, pred + aimUnit)
+            if rawHit and (a.Position - rawHit).Magnitude <= 125 and (a.Position - rootPos).Magnitude > 10 then
+                args[i] = CFrame.lookAt(aimPos, aimPos + aimUnit)
                 changed = true
             end
         elseif type(a) == "table" and isNetGun then
-            -- Hitscan / Gun shot arrays or hit info tables
-            for k, tv in pairs(a) do
-                if typeof(tv) == "Vector3" and isTargetVectorArg(tv, rawHit, rootPos, false) then
-                    a[k] = pred
-                    changed = true
-                elseif typeof(tv) == "Instance" and HookState.TargetPart and isInstanceUnder(tv, Workspace) and k == "Hit" then
-                    a[k] = HookState.TargetPart
-                    changed = true
-                end
+            if redirectNestedGunTable(a, 1, aimPos, rawHit, rootPos) then
+                changed = true
             end
         end
     end
     return changed
 end
 HookState.RedirectFn = redirectRemoteArgs
+HookState.RemoteAllowFn = isAllowedGunOrSkillRemoteName
 
 local RSMouseTbl: { [string]: any }? = nil
 pcall(function()
@@ -802,15 +955,17 @@ end
 clearRSMouseRawKeys()
 
 HookState.ReadyFn = isSilentHookReady
+HookState.AimPosFn = getEffectiveAimPos
 HookState.HitCFrameFn = getHookHitCFrame
 HookState.ClearRSMouseFn = clearRSMouseRawKeys
 HookState.NativeRSMouse = NativeRSMouse
 HookState.NativeRSMouseHas = NativeRSMouseHas
 HookState.FromMouseFn = function(ctx: any): any
+    local pos = getEffectiveAimPos(false)
     if type(ctx) == "table" and not ctx.mouse and type(ctx.aim) == "function" then
-        return ctx:aim(HookState.PredPos)
+        return ctx:aim(pos)
     end
-    return HookState.PredPos
+    return pos
 end
 
 ;(function()
@@ -842,10 +997,10 @@ end
         end)
     end
 
-    if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 5 then
+    if (tonumber(rawget(Env, "__BFSilentCoreHookVer")) or 0) >= 6 then
         return
     end
-    Env.__BFSilentCoreHookVer = 5
+    Env.__BFSilentCoreHookVer = 6
     Env.__BFSilentHooksInstalled = true
 
     local PlayerMouse: Mouse? = nil
@@ -883,18 +1038,18 @@ end
                 mt.__index = wrapC(function(self, key)
                     local readyFn = HookState.ReadyFn
                     if readyFn and readyFn(false, true) then
+                        local aimFn = HookState.AimPosFn
+                        local aimPos = (aimFn and aimFn(true)) or HookState.PredPos
                         if key == "Hit" then
                             local cfFn = HookState.HitCFrameFn
                             local cf = cfFn and cfFn()
                             if cf then return cf end
                         elseif key == "Target" and HookState.TargetPart and HookState.ToolKind == "Gun" then
                             return HookState.TargetPart
-                        elseif key == "Origin" then
-                            local p = HookState.PredPos :: Vector3
-                            return CFrame.lookAt(HookState.ShotOrigin, p)
-                        elseif key == "UnitRay" then
-                            local p = HookState.PredPos :: Vector3
-                            return Ray.new(HookState.ShotOrigin, (p - HookState.ShotOrigin).Unit)
+                        elseif key == "Origin" and aimPos then
+                            return CFrame.lookAt(HookState.ShotOrigin, aimPos)
+                        elseif key == "UnitRay" and aimPos then
+                            return Ray.new(HookState.ShotOrigin, (aimPos - HookState.ShotOrigin).Unit)
                         end
                     end
                     if key == "Hit" or key == "Target" or key == "Origin" or key == "UnitRay" then
@@ -934,20 +1089,39 @@ end
         end
     end)
 
-    -- 3. Util.GetMousePoint & CombatUtil.GetTargetPosition hooks (reload-safe dynamic dispatch)
+    -- 3. Util.GetMousePoint & CombatUtil.GetTargetPosition hooks (dynamically pick HitscanPos vs PredPos)
     pcall(function()
         local util = ReplicatedStorage:FindFirstChild("Util")
+        local gmpHookedFn: any = nil
         local gmp = util and util:FindFirstChild("GetMousePoint")
         if gmp and gmp:IsA("ModuleScript") and hookfunction then
             local gmpFn = require(gmp)
             if type(gmpFn) == "function" then
+                gmpHookedFn = gmpFn
                 local origGmp
                 origGmp = hookfunction(gmpFn, wrapC(function(...)
                     local readyFn = HookState.ReadyFn
-                    if readyFn and readyFn(true, true) and HookState.PredPos then
-                        return HookState.PredPos
+                    if readyFn and readyFn(true, true) then
+                        local aimFn = HookState.AimPosFn
+                        local pos = (aimFn and aimFn(true)) or HookState.PredPos
+                        if pos then return pos end
                     end
                     return origGmp(...)
+                end))
+            end
+        end
+        if util and util:IsA("ModuleScript") and hookfunction then
+            local okU, uTbl = pcall(require, util)
+            if okU and type(uTbl) == "table" and type(uTbl.GetMousePoint) == "function" and not rawequal(uTbl.GetMousePoint, gmpHookedFn) then
+                local origUGmp
+                origUGmp = hookfunction(uTbl.GetMousePoint, wrapC(function(...)
+                    local readyFn = HookState.ReadyFn
+                    if readyFn and readyFn(true, true) then
+                        local aimFn = HookState.AimPosFn
+                        local pos = (aimFn and aimFn(true)) or HookState.PredPos
+                        if pos then return pos end
+                    end
+                    return origUGmp(...)
                 end))
             end
         end
@@ -959,8 +1133,10 @@ end
                 local origGTP
                 origGTP = hookfunction(cu.GetTargetPosition, wrapC(function(...)
                     local readyFn = HookState.ReadyFn
-                    if readyFn and readyFn(true, true) and HookState.PredPos then
-                        return HookState.PredPos
+                    if readyFn and readyFn(true, true) then
+                        local aimFn = HookState.AimPosFn
+                        local pos = (aimFn and aimFn(true)) or HookState.PredPos
+                        if pos then return pos end
                     end
                     return origGTP(...)
                 end))
@@ -976,18 +1152,18 @@ end
                 if not checkcaller() and PlayerMouse and typeof(self) == "Instance" and rawequal(self, PlayerMouse) then
                     local readyFn = HookState.ReadyFn
                     if readyFn and readyFn(false, true) then
+                        local aimFn = HookState.AimPosFn
+                        local aimPos = (aimFn and aimFn(true)) or HookState.PredPos
                         if key == "Hit" then
                             local cfFn = HookState.HitCFrameFn
                             local cf = cfFn and cfFn()
                             if cf then return cf end
                         elseif key == "Target" and HookState.TargetPart and HookState.ToolKind == "Gun" then
                             return HookState.TargetPart
-                        elseif key == "Origin" then
-                            local p = HookState.PredPos :: Vector3
-                            return CFrame.lookAt(HookState.ShotOrigin, p)
-                        elseif key == "UnitRay" then
-                            local p = HookState.PredPos :: Vector3
-                            return Ray.new(HookState.ShotOrigin, (p - HookState.ShotOrigin).Unit)
+                        elseif key == "Origin" and aimPos then
+                            return CFrame.lookAt(HookState.ShotOrigin, aimPos)
+                        elseif key == "UnitRay" and aimPos then
+                            return Ray.new(HookState.ShotOrigin, (aimPos - HookState.ShotOrigin).Unit)
                         end
                     end
                 end
@@ -996,10 +1172,11 @@ end
         end
     end)
 
-    -- 5. game __namecall hook (ZERO OP_NAMECALL inside hook; never breaks Dash/Dodge/Skills)
+    -- 5. game __namecall hook (ZERO OP_NAMECALL inside hook; covers Gun remotes, ShootFunction & ViewportPointToRay)
     pcall(function()
         if hookmetamethod and checkcaller and getnamecallmethod and hasNewC then
             local setNcm = (type(setnamecallmethod) == "function") and setnamecallmethod or nil
+            local getCs = (type(getcallingscript) == "function") and getcallingscript or nil
             local origNamecall
             origNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                 if not checkcaller() and typeof(self) == "Instance" and HookState.Active and HookState.PredPos and HookState.HasCombatTool == true and HookState.AllowMouseOverride == true then
@@ -1018,18 +1195,47 @@ end
                                 return origNamecall(self, ...)
                             end
                         end
-                        if rName == "RE/ShootGunEvent"
+                        local allowFn = HookState.RemoteAllowFn
+                        local allowed = allowFn and allowFn(rName) or (
+                            rName == "RE/ShootGunEvent"
                             or rName == "RemoteFunctionShoot"
+                            or rName == "ShootFunction"
                             or rName == "RemoteEvent"
                             or rName == "LeftClickRemote"
+                            or rName == "RemoteFunction"
                             or rName == "CommE"
-                        then
+                        )
+                        if allowed then
                             local args = table.pack(...)
                             local redir = HookState.RedirectFn or redirectRemoteArgs
                             local okRedir, changed = pcall(redir, self, method, args, args.n)
                             if setNcm then setNcm(method) end
                             if okRedir and changed then
                                 return origNamecall(self, table.unpack(args, 1, args.n))
+                            end
+                        end
+                    elseif (method == "ViewportPointToRay" or method == "ScreenPointToRay") and HookState.ToolKind == "Gun" then
+                        local readyFn = HookState.ReadyFn
+                        if readyFn and readyFn(true, true) and os.clock() <= (HookState.GunRayWindowUntil or 0) then
+                            local curCam = Workspace.CurrentCamera
+                            if curCam and rawequal(self, curCam) then
+                                local cs = getCs and getCs() or nil
+                                local csName = cs and cs.Name or ""
+                                if csName ~= "WrapMouse" and csName ~= "WrapMouse2" and csName ~= "Mouse" then
+                                    local aimFn = HookState.AimPosFn
+                                    local targetPos = (aimFn and aimFn(true)) or HookState.PredPos
+                                    if targetPos then
+                                        if setNcm then setNcm(method) end
+                                        local origRay = origNamecall(self, ...)
+                                        if typeof(origRay) == "Ray" then
+                                            local d = targetPos - origRay.Origin
+                                            if d.Magnitude > 0.01 then
+                                                return Ray.new(origRay.Origin, d.Unit)
+                                            end
+                                        end
+                                        return origRay
+                                    end
+                                end
                             end
                         end
                     end
@@ -1513,15 +1719,8 @@ local function snapCharacterToward(pos: Vector3)
     end
 end
 
-local SKILL_KEYS = {
-    [Enum.KeyCode.Z] = true,
-    [Enum.KeyCode.X] = true,
-    [Enum.KeyCode.C] = true,
-    [Enum.KeyCode.V] = true,
-}
-
 -- ============================================================================
--- 7. COMPACT OBSIDIAN TACTICAL UI (468 x 362 px)
+-- 7. COMPACT OBSIDIAN TACTICAL UI (472 x 396 px)
 -- ============================================================================
 local THEME = {
     BgMain = Color3.fromRGB(11, 14, 20),
@@ -1616,7 +1815,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v4.5"
+TitleLbl.Text = "DELTA · Blox Fruits v4.6"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2290,11 +2489,19 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
         end
         refreshMenuUI()
     end
-    if isSilentHookReady(false, true) and HookState.PredPos and SKILL_KEYS[inp.KeyCode] then
-        local nowK = os.clock()
-        if nowK - lastFaceSnapAt > 0.04 then
-            lastFaceSnapAt = nowK
-            pcall(snapCharacterToward, HookState.PredPos :: Vector3)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+        HookState.GunRayWindowUntil = os.clock() + 0.45
+    end
+    if SKILL_KEYS[inp.KeyCode] then
+        local nowSk = os.clock()
+        HookState.LastSkillTick = nowSk
+        Env.__BFLastSkillTick = nowSk
+        HookState.GunRayWindowUntil = nowSk + 0.65
+        if isSilentHookReady(false, true) and HookState.PredPos then
+            if nowSk - lastFaceSnapAt > 0.04 then
+                lastFaceSnapAt = nowSk
+                pcall(snapCharacterToward, HookState.PredPos :: Vector3)
+            end
         end
     end
 end)
@@ -2368,11 +2575,33 @@ local function classifyEquippedTool(ch: Model?): (boolean, Tool?, string)
         end
     end
 
-    local wType = tostring(tool:GetAttribute("WeaponType") or "")
+    local eqData, _, wType = BF.LookupWeaponData(tool)
     local tip = tostring(tool.ToolTip or "")
-    local kind = COMBAT_KINDS[wType] and wType or (COMBAT_KINDS[tip] and tip or "")
+    local wdType = eqData and tostring(eqData.WeaponType or "") or ""
+    local kind = COMBAT_KINDS[wdType] and wdType
+        or (COMBAT_KINDS[wType] and wType
+        or (COMBAT_KINDS[tip] and tip or ""))
     if kind == "" then
-        if tool:FindFirstChild("RemoteFunctionShoot") ~= nil or nameLow:find("gun", 1, true) or nameLow:find("rifle", 1, true) or nameLow:find("guitar", 1, true) or nameLow:find("slingshot", 1, true) or nameLow:find("cannon", 1, true) or nameLow:find("bazooka", 1, true) or nameLow:find("kabucha", 1, true) or nameLow:find("bizarre", 1, true) or nameLow:find("flintlock", 1, true) or nameLow:find("musket", 1, true) or nameLow:find("acidum", 1, true) then
+        if tool:FindFirstChild("RemoteFunctionShoot") ~= nil
+            or tool:FindFirstChild("ShootFunction") ~= nil
+            or nameLow:find("gun", 1, true)
+            or nameLow:find("rifle", 1, true)
+            or nameLow:find("guitar", 1, true)
+            or nameLow:find("slingshot", 1, true)
+            or nameLow:find("cannon", 1, true)
+            or nameLow:find("bazooka", 1, true)
+            or nameLow:find("kabucha", 1, true)
+            or nameLow:find("bizarre", 1, true)
+            or nameLow:find("flintlock", 1, true)
+            or nameLow:find("musket", 1, true)
+            or nameLow:find("acidum", 1, true)
+            or nameLow:find("dragonstorm", 1, true)
+            or nameLow:find("venom", 1, true)
+            or nameLow:find("serpent", 1, true)
+            or nameLow:find("bow", 1, true)
+            or nameLow:find("blaster", 1, true)
+            or nameLow:find("revolver", 1, true)
+        then
             kind = "Gun"
         elseif tool.Name:find("-", 1, true) ~= nil then
             kind = "Blox Fruit"
@@ -2484,9 +2713,10 @@ local function detectCursorAndNpcConflict(cam: Camera, aim2D: Vector2, origin3D:
         if mdl and Players:GetPlayerFromCharacter(mdl) == nil then
             local npcsFolder = Workspace:FindFirstChild("NPCs")
             local enemiesFolder = Workspace:FindFirstChild("Enemies")
+            local focusLocked = (Config.Silent.FocusOne and FocusedPlayer ~= nil)
             if (npcsFolder and mdl:IsDescendantOf(npcsFolder))
-                or (enemiesFolder and mdl:IsDescendantOf(enemiesFolder))
-                or mdl:FindFirstChildOfClass("Humanoid") ~= nil
+                or (not focusLocked and enemiesFolder and mdl:IsDescendantOf(enemiesFolder))
+                or (not focusLocked and mdl:FindFirstChildOfClass("Humanoid") ~= nil)
                 or mdl.Name:lower():find("fruit", 1, true) ~= nil
             then
                 return true, 0, "NPC/Fruit"
@@ -2549,6 +2779,36 @@ local function getRawMouseHitPos(cam: Camera): Vector3?
     return ray.Origin + ray.Direction * 500
 end
 
+local HitscanRayParams = RaycastParams.new()
+HitscanRayParams.FilterType = Enum.RaycastFilterType.Exclude
+HitscanRayParams.IgnoreWater = true
+
+local function resolveHitscanAimPos(origin: Vector3, targetModel: Model, primaryPart: BasePart): Vector3
+    local exclude: { Instance } = {}
+    if LocalPlayer.Character then table.insert(exclude, LocalPlayer.Character) end
+    local wo = Workspace:FindFirstChild("_WorldOrigin")
+    if wo then table.insert(exclude, wo) end
+    HitscanRayParams.FilterDescendantsInstances = exclude
+
+    local function isClear(pt: BasePart): boolean
+        local dir = pt.Position - origin
+        if dir.Magnitude <= 0.1 then return true end
+        local res = Workspace:Raycast(origin, dir, HitscanRayParams)
+        return (res == nil) or res.Instance:IsDescendantOf(targetModel)
+    end
+
+    if isClear(primaryPart) then
+        return primaryPart.Position
+    end
+    for _, name in ipairs({ "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso", "RightUpperArm", "LeftUpperArm" }) do
+        local alt = targetModel:FindFirstChild(name)
+        if alt and alt:IsA("BasePart") and alt ~= primaryPart and isClear(alt) then
+            return alt.Position
+        end
+    end
+    return primaryPart.Position
+end
+
 local lastStatsClock = 0
 local fpsFrames, fpsAcc = 0, 0
 local standbyReason = ""
@@ -2580,6 +2840,17 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
     HookState.HasCombatTool = hasCombatTool
     HookState.EquippedTool = eqTool
     HookState.ToolKind = toolKind
+
+    local eqData = (toolKind == "Gun") and BF.LookupWeaponData(eqTool) or nil
+    local eqNameLow = eqTool and eqTool.Name:lower() or ""
+    local isHitscanWeapon = (toolKind == "Gun")
+        and ((eqData and eqData.HitType == "Hitscan")
+            or (eqData == nil and not eqNameLow:find("guitar", 1, true) and not eqNameLow:find("cannon", 1, true) and not eqNameLow:find("bazooka", 1, true)))
+    local usingSkillNow = isSkillInputActive(eqTool, tonumber(HookState.LastSkillTick) or 0)
+    HookState.IsHitscanGunM1 = (isHitscanWeapon and not usingSkillNow) == true
+    if toolKind == "Gun" and (UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) or usingSkillNow) then
+        HookState.GunRayWindowUntil = math.max(tonumber(HookState.GunRayWindowUntil) or 0, now + 0.25)
+    end
 
     local silentOn = isSilentModeActive()
     local blockedInteract, closestNpcDist, blockReason = false, math.huge, ""
@@ -2640,24 +2911,30 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
         chancePass = math.random(1, 100) <= Config.Silent.HitChance
     end
 
-    if canLock and predPos and targetPart and chancePass then
+    if canLock and predPos and targetPart and targetModel and chancePass then
+        local liveHitPos = HookState.IsHitscanGunM1
+            and resolveHitscanAimPos(shotOrigin, targetModel, targetPart)
+            or targetPart.Position
         HookState.Active = true
         HookState.AllowMouseOverride = true
         HookState.PredPos = predPos
+        HookState.HitscanPos = liveHitPos
         HookState.TargetPart = targetPart
         HookState.TargetDist = (targetPart.Position - shotOrigin).Magnitude
-        local sp = cam:WorldToViewportPoint(predPos)
+        local visAim = getEffectiveAimPos(true) or predPos
+        local sp = cam:WorldToViewportPoint(visAim)
         HookState.ScreenPos = Vector2.new(sp.X, sp.Y)
 
         -- Sync held weapon's MousePos Vector3Value only while actively locked onto a Player
         local mp = eqTool and eqTool:FindFirstChild("MousePos")
         if mp and mp:IsA("Vector3Value") then
-            mp.Value = predPos
+            mp.Value = visAim
         end
     else
         HookState.Active = false
         HookState.AllowMouseOverride = false
         HookState.PredPos = nil
+        HookState.HitscanPos = nil
         HookState.TargetPart = nil
         HookState.TargetDist = math.huge
         clearRSMouseRawKeys()
@@ -2682,9 +2959,10 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
         end
     end
 
+    local dotAimPos = getEffectiveAimPos(true) or predPos
     if LeadDot then
-        if silentOn and Config.Silent.ShowLeadLine and predPos and targetPart then
-            local p2d, onScr = cam:WorldToViewportPoint(predPos)
+        if silentOn and Config.Silent.ShowLeadLine and dotAimPos and targetPart then
+            local p2d, onScr = cam:WorldToViewportPoint(dotAimPos)
             local r2d, rOn = cam:WorldToViewportPoint(targetPart.Position)
             if p2d.Z > 0.35 and onScr then
                 local pt = Vector2.new(p2d.X, p2d.Y)

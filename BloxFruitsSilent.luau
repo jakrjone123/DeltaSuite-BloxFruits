@@ -157,15 +157,15 @@ local Config = {
         IgnoreSafeZone = true,
         HitChance = 100,
 
-        -- Omnidirectional 3D X / Y / Z Analytical Intercept + Strafe Coherence + 5-State Vertical Physics
+        -- Omnidirectional 3D X / Y / Z Analytical Intercept + Strafe Coherence + Wall-Slide + 5-State Vertical Physics
         Prediction = true,
         AutoPing = true,
         AutoWeaponSpeed = true,
-        ProjSpeed = 640, -- calibrated studs/sec fallback for non-MovesetV2 skills
-        BaseLeadMs = 18, -- 1-tick server initiation lead (ms)
-        PredX = 1.04, -- optimal symmetric lateral/horizontal X scale
-        PredY = 1.00, -- exact 1:1 vertical Y scale paired with 5-state air/jump/fall physics
-        PredZ = 1.04, -- optimal symmetric lateral/horizontal Z scale
+        ProjSpeed = 660, -- calibrated studs/sec fallback for classic non-MovesetV2 skills
+        BaseLeadMs = 20, -- exact 1-step server replication/simulation lead (ms)
+        PredX = 1.05, -- optimal symmetric lateral/horizontal X scale
+        PredY = 1.02, -- optimal vertical Y scale paired with Frame-1 Jump/Geppo fusion & 5-state physics
+        PredZ = 1.05, -- optimal symmetric lateral/horizontal Z scale
         GravityCompY = true, -- 5-state vertical solver (Air-Stall, Flight, Apex, Freefall + Floor/Ceiling clamps)
         AccelLead = true, -- Coherence-stabilized EMA acceleration + circular TurnRate integration
     },
@@ -390,21 +390,40 @@ local function isSkillInputActive(eqTool: Tool?, lastSkillTick: number, lastRele
 end
 
 local SkillSharedCache: { [string]: any } = {}
+local SkillSharedMissAt: { [string]: number } = {}
+local MOVESET_SUBTABLE_KEYS = {
+    "Projectile",
+    "Dash",
+    "Beam",
+    "Slash",
+    "Blast",
+    "Missile",
+    "Orb",
+    "Wave",
+    "Travel",
+    "Rush",
+    "Strike",
+}
 
-local function getMovesetSkillShared(tool: Tool, moveKey: string): { [string]: any }?
+local function getMovesetSkillShared(tool: Tool, moveKey: string): ({ [string]: any }?, { [string]: any }?)
     local awkFolder = tool:FindFirstChild("AwakenedMoves")
     local isAwk = (awkFolder ~= nil and awkFolder:FindFirstChild(moveKey) ~= nil)
     local cacheKey = tool.Name .. "|" .. moveKey .. (isAwk and "|1" or "|0")
     local cached = SkillSharedCache[cacheKey]
     if cached ~= nil then
-        return cached ~= false and cached or nil
+        return cached.MoveShared, cached.SetShared
+    end
+    local now = os.clock()
+    local lastMiss = SkillSharedMissAt[cacheKey]
+    if lastMiss and (now - lastMiss) < 2.0 then
+        return nil, nil
     end
 
     local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local mm = pg and pg:FindFirstChild("MovesetModules")
     local container = mm and mm:FindFirstChild(tool.Name)
     if not container then
-        return nil
+        return nil, nil
     end
 
     local moveSetName: string? = tool.Name
@@ -422,16 +441,58 @@ local function getMovesetSkillShared(tool: Tool, moveKey: string): { [string]: a
     end
 
     local setFolder = moveSetName and container:FindFirstChild(moveSetName) or container:FindFirstChild(tool.Name)
+    local setSharedTbl: { [string]: any }? = nil
+    local setShMod = setFolder and setFolder:FindFirstChild("Shared")
+    if setShMod and setShMod:IsA("ModuleScript") then
+        local okS, sTbl = pcall(require, setShMod)
+        if okS and type(sTbl) == "table" then
+            setSharedTbl = sTbl
+        end
+    end
+
     local mFolder = setFolder and setFolder:FindFirstChild(targetMove)
     local shMod = mFolder and mFolder:FindFirstChild("Shared")
     if shMod and shMod:IsA("ModuleScript") then
         local ok, tbl = pcall(require, shMod)
         if ok and type(tbl) == "table" then
-            SkillSharedCache[cacheKey] = tbl
-            return tbl
+            SkillSharedCache[cacheKey] = {
+                MoveShared = tbl,
+                SetShared = setSharedTbl,
+            }
+            SkillSharedMissAt[cacheKey] = nil
+            return tbl, setSharedTbl
         end
     end
-    SkillSharedCache[cacheKey] = false
+
+    -- Short retry cooldown instead of permanent false in case MovesetModules children are still streaming
+    SkillSharedMissAt[cacheKey] = now
+    return nil, setSharedTbl
+end
+
+local function extractTableSpeed(tbl: { [string]: any }): number?
+    local step = tonumber(tbl.Step)
+    if step and step > 3.5 then
+        local fpsScale = tonumber(tbl.FrameRateScale) or 60
+        return math.clamp(step * fpsScale, 120, 2600)
+    end
+    local spd = tonumber(
+        tbl.ProjectileSpeed
+        or tbl.BulletSpeed
+        or tbl.TravelSpeed
+        or tbl.DashSpeed
+        or tbl.SlashSpeed
+        or tbl.MissileSpeed
+        or tbl.BeamSpeed
+        or tbl.Speed
+    )
+    if spd and spd > 40 then
+        return math.clamp(spd, 120, 2600)
+    end
+    local dist = tonumber(tbl.Distance or tbl.MaxDistance or tbl.Range)
+    local dur = tonumber(tbl.Duration or tbl.TravelTime or tbl.TweenTime)
+    if dist and dur and dist > 20 and dur >= 0.05 and dur <= 2.5 then
+        return math.clamp(dist / dur, 140, 2400)
+    end
     return nil
 end
 
@@ -447,26 +508,22 @@ function BF.GetActiveWeaponBallistics(usingSkill: boolean?, skillKey: string?): 
 
     -- 1. Live MovesetModules Shared physics extraction per skill key (Z / X / C / V / F)
     if usingSkill and skillKey then
-        local sh = getMovesetSkillShared(tool, skillKey)
+        local sh, setSh = getMovesetSkillShared(tool, skillKey)
         if sh then
             local windup = 0
-            local tim = type(sh.Timing) == "table" and sh.Timing or nil
+            local tim = type(sh.Timing) == "table" and sh.Timing or (setSh and type(setSh.Timing) == "table" and setSh.Timing or nil)
             if tim then
-                windup = tonumber(tim.SnakeGenerationDelay or tim.ClientReleaseEffectDelay or tim.DashTeleportDelay) or 0
+                windup = tonumber(
+                    tim.SnakeGenerationDelay
+                    or tim.ClientReleaseEffectDelay
+                    or tim.DashTeleportDelay
+                    or tim.StartupTime
+                    or tim.CastDelay
+                    or tim.Windup
+                    or tim.ReleaseDelay
+                    or tim.FireDelay
+                ) or 0
                 windup = math.clamp(windup, 0, 0.16)
-            end
-
-            local proj = type(sh.Projectile) == "table" and sh.Projectile or nil
-            if proj then
-                local step = tonumber(proj.Step)
-                if step and step > 4 then
-                    local fpsScale = tonumber(proj.FrameRateScale) or 60
-                    return math.clamp(step * fpsScale, 120, 2600), windup
-                end
-                local pSpd = tonumber(proj.Speed or proj.ProjectileSpeed)
-                if pSpd and pSpd > 40 then
-                    return math.clamp(pSpd, 120, 2600), windup
-                end
             end
 
             local chg = type(sh.Charge) == "table" and sh.Charge or nil
@@ -481,8 +538,18 @@ function BF.GetActiveWeaponBallistics(usingSkill: boolean?, skillKey: string?): 
                 if baseSpd and baseSpd > 40 then
                     local growth = tonumber(chg.SpeedGrowth) or 0
                     local cMin = tonumber(chg.SpeedClampMin) or 80
-                    local cMax = tonumber(chg.SpeedClampMax) or 1800
+                    local cMax = tonumber(chg.SpeedClampMax) or 1900
                     return math.clamp(baseSpd + growth * holdDur, math.max(cMin, 80), cMax), windup
+                end
+            end
+
+            for _, subKey in ipairs(MOVESET_SUBTABLE_KEYS) do
+                local sub = sh[subKey]
+                if type(sub) == "table" then
+                    local subSpd = extractTableSpeed(sub)
+                    if subSpd then
+                        return subSpd, windup
+                    end
                 end
             end
 
@@ -490,15 +557,15 @@ function BF.GetActiveWeaponBallistics(usingSkill: boolean?, skillKey: string?): 
             local cAnim = type(sh.ClientAnimation) == "table" and sh.ClientAnimation or nil
             if aim and tonumber(aim.ServerDashRayDistance) and cAnim and tonumber(cAnim.DashTweenTime) then
                 local dSpd = (tonumber(aim.ServerDashRayDistance) :: number) / math.max(tonumber(cAnim.DashTweenTime) :: number, 0.08)
-                return math.clamp(dSpd, 180, 1800), windup
+                return math.clamp(dSpd, 180, 1900), windup
             end
 
-            local directSpd = tonumber(sh.ProjectileSpeed or sh.Speed)
-            if directSpd and directSpd > 40 then
-                return math.clamp(directSpd, 120, 2600), windup
+            local directSpd = extractTableSpeed(sh) or (setSh and extractTableSpeed(setSh) or nil)
+            if directSpd then
+                return directSpd, windup
             end
             if tonumber(sh.ChargeRange or sh.GrabDistance or sh.Range) then
-                return 780, windup
+                return 800, windup
             end
         end
     end
@@ -507,7 +574,7 @@ function BF.GetActiveWeaponBallistics(usingSkill: boolean?, skillKey: string?): 
     local data, wName, wType = BF.LookupWeaponData(tool)
     if data and data.WeaponType == "Gun" then
         if data.HitType == "Hitscan" then
-            return usingSkill and math.clamp(Config.Silent.ProjSpeed, 420, 950) or 2600, 0
+            return usingSkill and math.clamp(Config.Silent.ProjSpeed, 460, 960) or 2600, 0
         end
         local spd = tonumber(data.ProjectileSpeed or data.Speed or data.BulletSpeed)
         if spd and spd > 0 then
@@ -518,10 +585,14 @@ function BF.GetActiveWeaponBallistics(usingSkill: boolean?, skillKey: string?): 
         end
     end
     if wType == "Gun" or (data and data.WeaponType == "Gun") then
-        if wName:lower():find("guitar") then return 340, 0 end
-        return usingSkill and math.clamp(Config.Silent.ProjSpeed, 420, 950) or 1900, 0
-    elseif wType == "Melee" or wType == "Sword" then
+        local wLow = wName:lower()
+        if wLow:find("guitar") then return 340, 0 end
+        if wLow:find("cannon") or wLow:find("bazooka") then return 440, 0 end
+        return usingSkill and math.clamp(Config.Silent.ProjSpeed, 460, 960) or 1900, 0
+    elseif wType == "Melee" then
         return 880, 0
+    elseif wType == "Sword" then
+        return 840, 0
     end
     return math.clamp(Config.Silent.ProjSpeed, 60, 3000), 0
 end
@@ -531,7 +602,7 @@ function BF.GetActiveWeaponProjSpeed(usingSkill: boolean?): number
     return spd
 end
 
--- Per-Player 3D (X, Y, Z) Omnidirectional Tracker: Sub-Packet Dead-Reckoning + Strafe Coherence + Curvature + Vertical State
+-- Per-Player 3D (X, Y, Z) Omnidirectional Tracker: 3-Packet Jitter Filter + Instant Y-Jump Fusion + Curvature + Vertical State
 type MotionSample = {
     LastPos: Vector3,
     LastMovedPos: Vector3,
@@ -540,6 +611,7 @@ type MotionSample = {
     PacketPos: Vector3,
     PacketTime: number,
     PacketVel: Vector3,
+    PrevPacketVel: Vector3,
     SmoothedVel: Vector3,
     TrendVel: Vector3,
     PrevVel: Vector3,
@@ -553,6 +625,16 @@ type MotionSample = {
 local MotionCache: { [Player]: MotionSample } = {}
 local smoothedPingMs: number? = nil
 local lastPingClock = 0
+local pingRing = { 60, 60, 60 }
+local pingRingIdx = 0
+local pingRingCount = 0
+
+local function median3(a: number, b: number, c: number): number
+    if a > b then a, b = b, a end
+    if b > c then b, c = c, b end
+    if a > b then a, b = b, a end
+    return b
+end
 
 local function hasAirStallMover(root: BasePart): boolean
     return root:FindFirstChildOfClass("BodyPosition") ~= nil
@@ -578,6 +660,7 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
             PacketPos = curPos,
             PacketTime = now,
             PacketVel = rawAsmVel,
+            PrevPacketVel = rawAsmVel,
             SmoothedVel = rawAsmVel,
             TrendVel = rawAsmVel,
             PrevVel = rawAsmVel,
@@ -606,6 +689,7 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
         rec.PacketPos = curPos
         rec.PacketTime = now
         rec.PacketVel = rawAsmVel
+        rec.PrevPacketVel = rawAsmVel
         rec.SmoothedVel = rawAsmVel
         rec.TrendVel = rawAsmVel
         rec.PrevVel = rawAsmVel
@@ -618,8 +702,8 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
         return rec
     end
 
-    -- Track exact sub-packet step timing for 144Hz inter-packet dead-reckoning
-    if (curPos - rec.LastMovedPos).Magnitude >= 0.018 then
+    -- Track exact sub-packet step timing for 144Hz/240Hz inter-packet dead-reckoning
+    if (curPos - rec.LastMovedPos).Magnitude >= 0.016 then
         rec.LastMovedPos = curPos
         rec.LastMoveClock = now
         rec.StaleStep = false
@@ -627,23 +711,33 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
         rec.StaleStep = true
     end
 
-    -- Measure displacement + angular turn rate over real replication packet intervals
+    -- Measure displacement + angular turn rate over replication packet intervals with arrival-jitter suppression
     local pDisp = curPos - rec.PacketPos
     local pDt = now - rec.PacketTime
-    if pDisp.Magnitude >= 0.055 or pDt >= 0.080 then
+    if pDisp.Magnitude >= 0.050 or pDt >= 0.075 then
         local rawPVel = pDisp / math.max(pDt, 0.016)
         if rawPVel.Magnitude <= 260 and rawPVel.X == rawPVel.X then
-            rec.PacketVel = rawPVel
-            local flatSpd = math.sqrt(rawPVel.X * rawPVel.X + rawPVel.Z * rawPVel.Z)
+            local prevPV = rec.PrevPacketVel
+            local rMag, pMag = rawPVel.Magnitude, prevPV.Magnitude
+            if rMag > 2.5 and pMag > 2.5 and rawPVel:Dot(prevPV) > (rMag * pMag * 0.62) then
+                -- Aligned steady motion: damp ±8ms network arrival-time jitter while keeping true speed
+                rec.PacketVel = prevPV * 0.32 + rawPVel * 0.68
+            else
+                -- Direction change / impulse / stop: zero-lag instant transition
+                rec.PacketVel = rawPVel
+            end
+            rec.PrevPacketVel = rawPVel
+
+            local flatSpd = math.sqrt(rec.PacketVel.X * rec.PacketVel.X + rec.PacketVel.Z * rec.PacketVel.Z)
             if flatSpd >= 6 then
-                local hdg = math.atan2(rawPVel.Z, rawPVel.X)
+                local hdg = math.atan2(rec.PacketVel.Z, rec.PacketVel.X)
                 if rec.PrevHeading ~= nil then
                     local dHdg = math.atan2(math.sin(hdg - rec.PrevHeading), math.cos(hdg - rec.PrevHeading))
                     if math.abs(dHdg) > 1.85 then
                         rec.TurnRate = 0
                     else
                         local rawTurn = math.clamp(dHdg / math.max(pDt, 0.025), -4.5, 4.5)
-                        rec.TurnRate = rec.TurnRate + (rawTurn - rec.TurnRate) * 0.44
+                        rec.TurnRate = rec.TurnRate + (rawTurn - rec.TurnRate) * 0.46
                     end
                 end
                 rec.PrevHeading = hdg
@@ -658,11 +752,11 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
 
     local pkVel = rec.PacketVel
     -- Snap cleanly to zero when target stops moving so stationary shots hit dead-center Chest
-    if rawAsmVel.Magnitude < 2.0 and pkVel.Magnitude < 2.3 then
-        local decayVel = rec.SmoothedVel * math.max(0, 1 - dt * 26)
-        if decayVel.Magnitude < 1.2 then decayVel = Vector3.zero end
+    if rawAsmVel.Magnitude < 1.9 and pkVel.Magnitude < 2.2 then
+        local decayVel = rec.SmoothedVel * math.max(0, 1 - dt * 28)
+        if decayVel.Magnitude < 1.15 then decayVel = Vector3.zero end
         rec.SmoothedVel = decayVel
-        rec.TrendVel = rec.TrendVel * math.max(0, 1 - dt * 16)
+        rec.TrendVel = rec.TrendVel * math.max(0, 1 - dt * 18)
         rec.PrevVel = decayVel
         rec.Accel = Vector3.zero
         rec.TurnRate = 0
@@ -673,41 +767,61 @@ local function samplePlayerMotion(player: Player, model: Model, root: BasePart, 
         return rec
     end
 
-    -- Fuse AssemblyLinearVelocity and PacketVel cleanly across X, Y, Z
-    local blendedVel: Vector3
-    if rawAsmVel.Magnitude > 2.0 and pkVel.Magnitude > 2.0 then
-        if rawAsmVel:Dot(pkVel) > 0 then
-            blendedVel = rawAsmVel * 0.50 + pkVel * 0.50
+    -- Axis-split X/Z vs Y fusion:
+    -- X/Z balances replicated AssemblyLinearVelocity with jitter-filtered PacketVel;
+    -- Y weights instantaneous AssemblyLinearVelocity.Y on Jump/Geppo/Dive impulses for Frame-1 vertical accuracy!
+    local asmXZ = Vector2.new(rawAsmVel.X, rawAsmVel.Z)
+    local pkXZ = Vector2.new(pkVel.X, pkVel.Z)
+    local bx, bz: number, number
+    if asmXZ.Magnitude > 1.8 and pkXZ.Magnitude > 1.8 then
+        if asmXZ:Dot(pkXZ) > 0 then
+            bx = rawAsmVel.X * 0.50 + pkVel.X * 0.50
+            bz = rawAsmVel.Z * 0.50 + pkVel.Z * 0.50
         else
-            blendedVel = rawAsmVel * 0.20 + pkVel * 0.80
+            bx = rawAsmVel.X * 0.20 + pkVel.X * 0.80
+            bz = rawAsmVel.Z * 0.20 + pkVel.Z * 0.80
+        end
+    elseif pkXZ.Magnitude >= asmXZ.Magnitude then
+        bx, bz = pkVel.X, pkVel.Z
+    else
+        bx, bz = rawAsmVel.X, rawAsmVel.Z
+    end
+
+    local by: number
+    if math.abs(rawAsmVel.Y) > 7.5 then
+        if math.abs(rawAsmVel.Y - pkVel.Y) > 22 and (rawAsmVel.Y * pkVel.Y <= 0 or math.abs(rawAsmVel.Y) > math.abs(pkVel.Y)) then
+            -- Instant Frame-1 Jump / Geppo sky-jump / slam takeoff
+            by = rawAsmVel.Y * 0.86 + pkVel.Y * 0.14
+        else
+            by = rawAsmVel.Y * 0.72 + pkVel.Y * 0.28
         end
     else
-        blendedVel = (pkVel.Magnitude > rawAsmVel.Magnitude) and pkVel or rawAsmVel
+        by = rawAsmVel.Y * 0.45 + pkVel.Y * 0.55
     end
 
-    local flatMag = Vector2.new(blendedVel.X, blendedVel.Z).Magnitude
+    local flatMag = math.sqrt(bx * bx + bz * bz)
     if flatMag > 215 then
         local sc = 215 / flatMag
-        blendedVel = Vector3.new(blendedVel.X * sc, blendedVel.Y, blendedVel.Z * sc)
+        bx, bz = bx * sc, bz * sc
     end
-    blendedVel = Vector3.new(blendedVel.X, math.clamp(blendedVel.Y, -175, 175), blendedVel.Z)
+    local blendedVel = Vector3.new(bx, math.clamp(by, -180, 180), bz)
 
-    local velAlpha = math.clamp(dt * 26, 0.32, 0.94)
-    local trendAlpha = math.clamp(dt * 6.8, 0.08, 0.42)
+    local velAlpha = math.clamp(dt * 28, 0.34, 0.95)
+    local trendAlpha = math.clamp(dt * 7.0, 0.08, 0.44)
     local nextVel = rec.SmoothedVel:Lerp(blendedVel, velAlpha)
     local nextTrend = rec.TrendVel:Lerp(blendedVel, trendAlpha)
     local rawAccel = (nextVel - rec.PrevVel) / math.max(dt, 0.016)
-    if rawAccel.Magnitude > 75 then
-        rawAccel = rawAccel.Unit * 75
+    if rawAccel.Magnitude > 78 then
+        rawAccel = rawAccel.Unit * 78
     end
 
-    -- Reset EMA acceleration on sharp turns (> ~50 deg) or sudden deceleration to prevent wild overshoot
+    -- Reset EMA acceleration on sharp turns (> ~50 deg) or sudden deceleration to prevent overshoot
     local mNext, mPrev = nextVel.Magnitude, rec.PrevVel.Magnitude
     local aligned = (mNext > 1 and mPrev > 1) and (nextVel:Dot(rec.PrevVel) > mNext * mPrev * 0.65) or false
     if not aligned or mNext < mPrev * 0.85 then
         rec.Accel = Vector3.zero
     else
-        local accAlpha = math.clamp(dt * 8.5, 0.10, 0.36)
+        local accAlpha = math.clamp(dt * 8.8, 0.10, 0.36)
         rec.Accel = rec.Accel:Lerp(rawAccel, accAlpha)
     end
 
@@ -722,7 +836,7 @@ end
 
 local GroundRayParams = RaycastParams.new()
 GroundRayParams.FilterType = Enum.RaycastFilterType.Exclude
-GroundRayParams.IgnoreWater = false
+GroundRayParams.IgnoreWater = true
 
 local function solveInterceptTimeQuadratic(relPos: Vector3, targetVel: Vector3, projSpeed: number): number
     local s = math.max(projSpeed, 60)
@@ -762,14 +876,14 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
     local rawPartPos = aimPart.Position
     local rootPart = model:FindFirstChild("HumanoidRootPart") :: BasePart?
     local basePos = rawPartPos
-    -- Anchor X/Z subtly toward physics root to eliminate flip/spin animation limb wobble while keeping true Chest Y height
+    -- Anchor X/Z toward physics root to eliminate flip/spin animation limb wobble while keeping true Chest Y height
     if rootPart and rootPart ~= aimPart then
         local off = rawPartPos - rootPart.Position
         if off.Magnitude <= 5.5 then
             basePos = Vector3.new(
-                rootPart.Position.X + off.X * 0.68,
-                rootPart.Position.Y + off.Y * 0.86,
-                rootPart.Position.Z + off.Z * 0.68
+                rootPart.Position.X + off.X * 0.65,
+                rootPart.Position.Y + off.Y * 0.88,
+                rootPart.Position.Z + off.Z * 0.65
             )
         end
     end
@@ -779,7 +893,7 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
     end
 
     local vel = sample.SmoothedVel
-    if vel.Magnitude < 1.2 then
+    if vel.Magnitude < 1.15 then
         return basePos
     end
     local trend = sample.TrendVel
@@ -789,18 +903,22 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
     -- Left/Right/Diagonal Strafe Coherence: 1.0 on committed runs/dashes, damps rapid A-D-A-D jiggle onto strafe centroid
     local fastXZMag = math.sqrt(vel.X * vel.X + vel.Z * vel.Z)
     local trendXZMag = math.sqrt(trend.X * trend.X + trend.Z * trend.Z)
-    local coherenceXZ = (fastXZMag > 4.5) and math.clamp(trendXZMag / fastXZMag, 0.36, 1.0) or 1.0
+    local coherenceXZ = (fastXZMag > 4.5) and math.clamp(trendXZMag / fastXZMag, 0.38, 1.0) or 1.0
     local effVx = trend.X + (vel.X - trend.X) * coherenceXZ
     local effVz = trend.Z + (vel.Z - trend.Z) * coherenceXZ
     local effVy = vel.Y
     local effVel = Vector3.new(effVx, effVy, effVz)
 
-    -- Sub-packet 144Hz dead-reckoning eliminates 20Hz replication freeze between packets
+    -- Sub-packet 144Hz/240Hz dead-reckoning eliminates 20Hz replication freeze between packets
     local livePos = basePos
     if sample.StaleStep then
-        local staleDt = math.clamp(os.clock() - (sample.LastMoveClock or os.clock()), 0, 0.046)
-        if staleDt > 0.004 then
-            livePos = basePos + effVel * (staleDt * 0.72)
+        local staleDt = math.clamp(os.clock() - (sample.LastMoveClock or os.clock()), 0, 0.048)
+        if staleDt > 0.003 then
+            livePos = Vector3.new(
+                basePos.X + effVx * (staleDt * 0.80),
+                basePos.Y + effVy * (staleDt * 0.65),
+                basePos.Z + effVz * (staleDt * 0.80)
+            )
         end
     end
 
@@ -813,16 +931,20 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
             return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
         end)
         if okPing and type(pingMs) == "number" and pingMs == pingMs then
-            local clamped = math.clamp(pingMs, 10, 480)
+            local clamped = math.clamp(pingMs, 8, 480)
+            pingRingIdx = (pingRingIdx % 3) + 1
+            pingRing[pingRingIdx] = clamped
+            if pingRingCount < 3 then pingRingCount += 1 end
+            local medPing = (pingRingCount >= 3) and median3(pingRing[1], pingRing[2], pingRing[3]) or clamped
             if not smoothedPingMs then
-                smoothedPingMs = clamped
+                smoothedPingMs = medPing
             else
-                local pAlpha = math.clamp(dtPing * 6, 0.06, 0.35)
-                smoothedPingMs = (smoothedPingMs :: number) + (clamped - (smoothedPingMs :: number)) * pAlpha
+                local pAlpha = math.clamp(dtPing * 6.5, 0.06, 0.35)
+                smoothedPingMs = (smoothedPingMs :: number) + (medPing - (smoothedPingMs :: number)) * pAlpha
             end
-            pingSec = math.clamp(((smoothedPingMs :: number) * 0.58) / 1000, 0.008, 0.23)
+            pingSec = math.clamp(((smoothedPingMs :: number) * 0.60) / 1000, 0.008, 0.24)
         elseif smoothedPingMs then
-            pingSec = math.clamp(((smoothedPingMs :: number) * 0.58) / 1000, 0.008, 0.23)
+            pingSec = math.clamp(((smoothedPingMs :: number) * 0.60) / 1000, 0.008, 0.24)
         end
     end
     local baseLeadSec = math.clamp(Config.Silent.BaseLeadMs / 1000, 0, 0.3)
@@ -852,28 +974,28 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
             end
         end
     end
-    if not airborne and not flying and math.abs(effVy) > 5.5 then
+    if not airborne and not flying and math.abs(effVy) > 5.2 then
         airborne = true
     end
 
-    -- Analytical closed-form 3D quadratic intercept time + 3 curvature/vertical refinement passes
+    -- Analytical closed-form 3D quadratic intercept time + 5 exact convergence passes
     local posAtLaunch = livePos + effVel * totalFixedLead
     local tFly = solveInterceptTimeQuadratic(posAtLaunch - origin, effVel, projSpeed)
     local t = totalFixedLead + tFly
     local flatSpeed = math.sqrt(effVx * effVx + effVz * effVz)
     local predPos = livePos
 
-    for _ = 1, 3 do
-        local tClamped = math.clamp(t, 0.006, 0.64)
-        local tEff = (tClamped <= 0.40) and tClamped or (0.40 + (tClamped - 0.40) * 0.74)
-        local t2 = 0.20 * tEff * tEff
-        local axOff = math.clamp(acc.X * t2 * coherenceXZ, -9, 9)
-        local azOff = math.clamp(acc.Z * t2 * coherenceXZ, -9, 9)
+    for _ = 1, 5 do
+        local tClamped = math.clamp(t, 0.006, 0.66)
+        local tEff = (tClamped <= 0.42) and tClamped or (0.42 + (tClamped - 0.42) * 0.76)
+        local t2 = 0.21 * tEff * tEff
+        local axOff = math.clamp(acc.X * t2 * coherenceXZ, -9.5, 9.5)
+        local azOff = math.clamp(acc.Z * t2 * coherenceXZ, -9.5, 9.5)
 
         local leadX: number
         local leadZ: number
-        if math.abs(turnRate) > 0.14 and flatSpeed > 6 and coherenceXZ > 0.55 then
-            local theta = math.clamp(turnRate * tEff * 0.86, -1.15, 1.15)
+        if math.abs(turnRate) > 0.13 and flatSpeed > 6 and coherenceXZ > 0.54 then
+            local theta = math.clamp(turnRate * tEff * 0.88, -1.18, 1.18)
             local wEff = theta / math.max(tEff, 0.006)
             if math.abs(wEff) > 0.05 then
                 local sinT = math.sin(theta)
@@ -895,21 +1017,21 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
             -- State 1 & 2: Powered flight or mid-air skill BodyPosition stall -> zero gravity pull!
             dy = effVy * tEff
         elseif Config.Silent.GravityCompY and airborne then
-            if effVy > 4.5 then
-                -- State 3: Ascending jump / Geppo (stronger gravity when decelerating into apex, lighter on active boost)
-                local gUp = (acc.Y < -30) and (Workspace.Gravity * 0.66) or (Workspace.Gravity * 0.26)
+            if effVy > 4.2 then
+                -- State 3: Ascending jump / Geppo (stronger gravity decelerating into apex, lighter on active boost)
+                local gUp = (acc.Y < -28) and (Workspace.Gravity * 0.68) or (Workspace.Gravity * 0.28)
                 dy = effVy * tEff - gUp * (0.5 * tEff * tEff)
-            elseif effVy < -4.5 then
+            elseif effVy < -4.2 then
                 -- State 4: Active freefall / dive (tapered near terminal velocity)
                 local termScale = math.clamp(1 - math.abs(effVy) / 155, 0.15, 1.0)
-                local gDown = Workspace.Gravity * 0.48 * termScale
+                local gDown = Workspace.Gravity * 0.50 * termScale
                 dy = effVy * tEff - gDown * (0.5 * tEff * tEff)
             else
                 dy = effVy * tEff
             end
         else
             -- State 5: Grounded / stairs / ramps
-            dy = effVy * tEff * 0.80 + math.clamp(acc.Y * t2, -5, 5)
+            dy = effVy * tEff * 0.82 + math.clamp(acc.Y * t2, -5, 5)
         end
 
         local dx = leadX * sx
@@ -920,18 +1042,47 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
         t = totalFixedLead + (predPos - origin).Magnitude / math.max(projSpeed, 60)
     end
 
-    -- Floor & Overhead Ceiling Ray Clamps for exact Up/Down landing & indoor precision
-    if Config.Silent.GravityCompY then
-        local exclude: { Instance } = { model }
-        if LocalPlayer.Character then table.insert(exclude, LocalPlayer.Character) end
-        local chars = Workspace:FindFirstChild("Characters")
-        if chars then table.insert(exclude, chars) end
-        local wo = Workspace:FindFirstChild("_WorldOrigin")
-        if wo then table.insert(exclude, wo) end
-        local enemies = Workspace:FindFirstChild("Enemies")
-        if enemies then table.insert(exclude, enemies) end
-        GroundRayParams.FilterDescendantsInstances = exclude
+    -- Solid Wall-Slide + Floor & Overhead Ceiling Ray Clamps (prevents predicting behind solid walls/cliffs or underground)
+    local exclude: { Instance } = { model }
+    if LocalPlayer.Character then table.insert(exclude, LocalPlayer.Character) end
+    local chars = Workspace:FindFirstChild("Characters")
+    if chars then table.insert(exclude, chars) end
+    local wo = Workspace:FindFirstChild("_WorldOrigin")
+    if wo then table.insert(exclude, wo) end
+    local enemies = Workspace:FindFirstChild("Enemies")
+    if enemies then table.insert(exclude, enemies) end
+    local boats = Workspace:FindFirstChild("Boats")
+    if boats then table.insert(exclude, boats) end
+    GroundRayParams.FilterDescendantsInstances = exclude
 
+    local moveSpan = predPos - livePos
+    if Vector2.new(moveSpan.X, moveSpan.Z).Magnitude > 2.2 then
+        local wHit = Workspace:Raycast(livePos, moveSpan, GroundRayParams)
+        if wHit and wHit.Instance and not wHit.Instance.CanCollide then
+            table.insert(exclude, wHit.Instance)
+            GroundRayParams.FilterDescendantsInstances = exclude
+            wHit = Workspace:Raycast(livePos, moveSpan, GroundRayParams)
+        end
+        if wHit and wHit.Instance and wHit.Instance.CanCollide and wHit.Normal.Y < 0.65 then
+            local nrm = wHit.Normal
+            local contactPos = wHit.Position + nrm * 1.35
+            local rem = predPos - wHit.Position
+            local intoWall = rem:Dot(nrm)
+            local slideVec = (intoWall < 0) and ((rem - nrm * intoWall) * 0.78) or Vector3.zero
+            if slideVec.Magnitude > 0.6 then
+                local sHit = Workspace:Raycast(contactPos, slideVec, GroundRayParams)
+                if sHit and sHit.Instance and sHit.Instance.CanCollide then
+                    predPos = sHit.Position + sHit.Normal * 1.35
+                else
+                    predPos = contactPos + slideVec
+                end
+            else
+                predPos = contactPos
+            end
+        end
+    end
+
+    if Config.Silent.GravityCompY then
         if predPos.Y < livePos.Y - 1.0 then
             local chestGroundH = math.clamp(basePos.Y - (rootPart and rootPart.Position.Y or basePos.Y) + 3.0, 2.3, 4.2)
             local probeStart = Vector3.new(predPos.X, math.max(livePos.Y, predPos.Y) + 8, predPos.Z)
@@ -958,8 +1109,8 @@ function BF.PredictPosition3D(player: Player, model: Model, aimPart: BasePart, o
         return basePos
     end
     local leadVec = predPos - basePos
-    if leadVec.Magnitude > 68 then
-        predPos = basePos + leadVec.Unit * 68
+    if leadVec.Magnitude > 70 then
+        predPos = basePos + leadVec.Unit * 70
     end
 
     return predPos
@@ -2179,7 +2330,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v5.0"
+TitleLbl.Text = "DELTA · Blox Fruits v5.1"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -2753,11 +2904,11 @@ addToggle(silentRight, "Auto Ping Lead", function() return Config.Silent.AutoPin
 addToggle(silentRight, "Auto Gun Speed", function() return Config.Silent.AutoWeaponSpeed end, function(v) Config.Silent.AutoWeaponSpeed = v end)
 addToggle(silentRight, "Gravity / Air Y", function() return Config.Silent.GravityCompY end, function(v) Config.Silent.GravityCompY = v end)
 addToggle(silentRight, "Accel / Dash Lead", function() return Config.Silent.AccelLead end, function(v) Config.Silent.AccelLead = v end)
-addSlider(silentRight, "Predict X", 0.0, 2.2, 0.05, "%.2fx", function() return Config.Silent.PredX end, function(v) Config.Silent.PredX = v end)
-addSlider(silentRight, "Predict Y", 0.0, 2.2, 0.05, "%.2fx", function() return Config.Silent.PredY end, function(v) Config.Silent.PredY = v end)
-addSlider(silentRight, "Predict Z", 0.0, 2.2, 0.05, "%.2fx", function() return Config.Silent.PredZ end, function(v) Config.Silent.PredZ = v end)
+addSlider(silentRight, "Predict X", 0.0, 2.2, 0.01, "%.2fx", function() return Config.Silent.PredX end, function(v) Config.Silent.PredX = v end)
+addSlider(silentRight, "Predict Y", 0.0, 2.2, 0.01, "%.2fx", function() return Config.Silent.PredY end, function(v) Config.Silent.PredY = v end)
+addSlider(silentRight, "Predict Z", 0.0, 2.2, 0.01, "%.2fx", function() return Config.Silent.PredZ end, function(v) Config.Silent.PredZ = v end)
 addSlider(silentRight, "Skill Speed", 100, 1500, 10, "%.0f", function() return Config.Silent.ProjSpeed end, function(v) Config.Silent.ProjSpeed = v end)
-addSlider(silentRight, "Cast Lead (ms)", 0, 260, 5, "%.0fms", function() return Config.Silent.BaseLeadMs end, function(v) Config.Silent.BaseLeadMs = v end)
+addSlider(silentRight, "Cast Lead (ms)", 0, 260, 1, "%.0fms", function() return Config.Silent.BaseLeadMs end, function(v) Config.Silent.BaseLeadMs = v end)
 addSlider(silentRight, "Hit Chance", 10, 100, 5, "%.0f%%", function() return Config.Silent.HitChance end, function(v) Config.Silent.HitChance = v end)
 
 -- Populate Tab 2: ESP (Player Visuals + Compact Controls)
@@ -2805,6 +2956,54 @@ Session.Bind(MinBtn.MouseButton1Click, function() setMenuVisible(false) end)
 -- ============================================================================
 -- 8. INPUT & MAIN LOOP + POST-CAMERA ESP RENDER STEP
 -- ============================================================================
+local HitscanRayParams = RaycastParams.new()
+HitscanRayParams.FilterType = Enum.RaycastFilterType.Exclude
+HitscanRayParams.IgnoreWater = true
+
+local HITSCAN_PEEK_OFFSETS = {
+    Vector3.new(0.62, 0.15, 0),
+    Vector3.new(-0.62, 0.15, 0),
+    Vector3.new(0, 0.55, 0),
+    Vector3.new(0, -0.45, 0),
+}
+
+local function resolveHitscanAimPos(origin: Vector3, targetModel: Model, primaryPart: BasePart): (Vector3, BasePart, boolean)
+    local exclude: { Instance } = {}
+    if LocalPlayer.Character then table.insert(exclude, LocalPlayer.Character) end
+    local wo = Workspace:FindFirstChild("_WorldOrigin")
+    if wo then table.insert(exclude, wo) end
+    local boats = Workspace:FindFirstChild("Boats")
+    if boats then table.insert(exclude, boats) end
+    local enemies = Workspace:FindFirstChild("Enemies")
+    if enemies then table.insert(exclude, enemies) end
+    HitscanRayParams.FilterDescendantsInstances = exclude
+
+    local function isClearPoint(worldPt: Vector3): boolean
+        local dir = worldPt - origin
+        if dir.Magnitude <= 0.1 then return true end
+        local res = Workspace:Raycast(origin, dir, HitscanRayParams)
+        return (res == nil) or res.Instance:IsDescendantOf(targetModel)
+    end
+
+    if isClearPoint(primaryPart.Position) then
+        return primaryPart.Position, primaryPart, true
+    end
+    local pCf = primaryPart.CFrame
+    for _, localOff in ipairs(HITSCAN_PEEK_OFFSETS) do
+        local peekPt = pCf:PointToWorldSpace(localOff)
+        if isClearPoint(peekPt) then
+            return peekPt, primaryPart, true
+        end
+    end
+    for _, name in ipairs({ "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso", "RightUpperArm", "LeftUpperArm" }) do
+        local alt = targetModel:FindFirstChild(name)
+        if alt and alt:IsA("BasePart") and alt ~= primaryPart and isClearPoint(alt.Position) then
+            return alt.Position, alt, true
+        end
+    end
+    return primaryPart.Position, primaryPart, false
+end
+
 Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean)
     local code: BindValue = (inp.KeyCode ~= Enum.KeyCode.Unknown) and inp.KeyCode or inp.UserInputType
     if ListeningPicker then
@@ -2867,7 +3066,24 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
         end
     end
     if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-        HookState.GunRayWindowUntil = os.clock() + 0.50
+        local nowClick = os.clock()
+        HookState.GunRayWindowUntil = nowClick + 0.50
+        local tPlr = HookState.TargetPlayer
+        local tMdl = HookState.TargetModel
+        local tPart = HookState.TargetPart
+        if HookState.Active and tPlr and tMdl and tPart and tPart.Parent then
+            local tRoot = tMdl:FindFirstChild("HumanoidRootPart") :: BasePart?
+            local tSample = tRoot and samplePlayerMotion(tPlr, tMdl, tRoot, nowClick) or MotionCache[tPlr]
+            if tSample then
+                HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
+            end
+            if HookState.IsHitscanGunM1 then
+                local hp, hPart, hClear = resolveHitscanAimPos(HookState.ShotOrigin, tMdl, tPart)
+                HookState.HitscanPos = hp
+                HookState.HitscanPart = hPart
+                HookState.HitscanClear = hClear
+            end
+        end
     end
     local skPressed = SKILL_KEYS[inp.KeyCode]
     if skPressed then
@@ -2882,10 +3098,13 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
         local tPlr = HookState.TargetPlayer
         local tMdl = HookState.TargetModel
         local tPart = HookState.TargetPart
-        local tSample = tPlr and MotionCache[tPlr] or nil
-        if HookState.Active and tPlr and tMdl and tPart and tSample and tPart.Parent then
-            HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
-            HookState.PredComputedSkill = skPressed
+        if HookState.Active and tPlr and tMdl and tPart and tPart.Parent then
+            local tRoot = tMdl:FindFirstChild("HumanoidRootPart") :: BasePart?
+            local tSample = tRoot and samplePlayerMotion(tPlr, tMdl, tRoot, nowSk) or MotionCache[tPlr]
+            if tSample then
+                HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
+                HookState.PredComputedSkill = skPressed
+            end
         end
         if isSilentHookReady(false, true) and HookState.PredPos then
             if nowSk - lastFaceSnapAt > 0.04 then
@@ -2904,6 +3123,17 @@ Session.Bind(UserInputService.InputEnded, function(inp: InputObject)
         HookState.LastSkillRelTick = nowR
         Env.__BFLastSkillRelTick = nowR
         HookState.GunRayWindowUntil = math.max(tonumber(HookState.GunRayWindowUntil) or 0, nowR + 0.42)
+        -- Recompute PredPos at exact hold-release instant so charged skills use true holdDur projectile speed
+        local tPlr = HookState.TargetPlayer
+        local tMdl = HookState.TargetModel
+        local tPart = HookState.TargetPart
+        if HookState.Active and tPlr and tMdl and tPart and tPart.Parent then
+            local tRoot = tMdl:FindFirstChild("HumanoidRootPart") :: BasePart?
+            local tSample = tRoot and samplePlayerMotion(tPlr, tMdl, tRoot, nowR) or MotionCache[tPlr]
+            if tSample then
+                HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
+            end
+        end
         if isSilentHookReady(false, true) and HookState.PredPos then
             if nowR - lastFaceSnapAt > 0.03 then
                 lastFaceSnapAt = nowR
@@ -3199,40 +3429,6 @@ local function getRawMouseHitPos(cam: Camera): Vector3?
     return ray.Origin + ray.Direction * 500
 end
 
-local HitscanRayParams = RaycastParams.new()
-HitscanRayParams.FilterType = Enum.RaycastFilterType.Exclude
-HitscanRayParams.IgnoreWater = true
-
-local function resolveHitscanAimPos(origin: Vector3, targetModel: Model, primaryPart: BasePart): (Vector3, BasePart, boolean)
-    local exclude: { Instance } = {}
-    if LocalPlayer.Character then table.insert(exclude, LocalPlayer.Character) end
-    local wo = Workspace:FindFirstChild("_WorldOrigin")
-    if wo then table.insert(exclude, wo) end
-    local boats = Workspace:FindFirstChild("Boats")
-    if boats then table.insert(exclude, boats) end
-    local enemies = Workspace:FindFirstChild("Enemies")
-    if enemies then table.insert(exclude, enemies) end
-    HitscanRayParams.FilterDescendantsInstances = exclude
-
-    local function isClear(pt: BasePart): boolean
-        local dir = pt.Position - origin
-        if dir.Magnitude <= 0.1 then return true end
-        local res = Workspace:Raycast(origin, dir, HitscanRayParams)
-        return (res == nil) or res.Instance:IsDescendantOf(targetModel)
-    end
-
-    if isClear(primaryPart) then
-        return primaryPart.Position, primaryPart, true
-    end
-    for _, name in ipairs({ "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso", "RightUpperArm", "LeftUpperArm" }) do
-        local alt = targetModel:FindFirstChild(name)
-        if alt and alt:IsA("BasePart") and alt ~= primaryPart and isClear(alt) then
-            return alt.Position, alt, true
-        end
-    end
-    return primaryPart.Position, primaryPart, false
-end
-
 local function getWeaponShotOrigin(lpRoot: BasePart?, cam: Camera, eqTool: Tool?, toolKind: string): Vector3
     if toolKind == "Gun" and eqTool then
         local ptr = eqTool:FindFirstChild("LocalEquippedWeaponPointer")
@@ -3244,8 +3440,12 @@ local function getWeaponShotOrigin(lpRoot: BasePart?, cam: Camera, eqTool: Tool?
                 return att.WorldPosition
             end
         end
+        local handle = eqTool:FindFirstChild("Handle")
+        if handle and handle:IsA("BasePart") then
+            return handle.Position
+        end
     end
-    return lpRoot and (lpRoot.Position + Vector3.new(0, 1.4, 0)) or cam.CFrame.Position
+    return lpRoot and (lpRoot.Position + Vector3.new(0, 0.85, 0)) or cam.CFrame.Position
 end
 
 local lastBusoClock = -10

@@ -360,31 +360,43 @@ function BF.LookupWeaponData(tool: Tool?): ({ [string]: any }?, string, string)
     return nil, wName, wType
 end
 
+-- Only Z / X / C / V skills receive Silent Aim (F mobility/teleport/dash skills like Portal F & Rumble F are excluded!)
 local SKILL_KEYS: { [Enum.KeyCode]: string } = {
     [Enum.KeyCode.Z] = "Z",
     [Enum.KeyCode.X] = "X",
     [Enum.KeyCode.C] = "C",
     [Enum.KeyCode.V] = "V",
-    [Enum.KeyCode.F] = "F",
+}
+local COMBAT_SKILL_NAMES: { [string]: boolean } = {
+    Z = true,
+    X = true,
+    C = true,
+    V = true,
 }
 
 local function isSkillInputActive(eqTool: Tool?, lastSkillTick: number, lastReleaseTick: number?): (boolean, string?)
+    if UserInputService:IsKeyDown(Enum.KeyCode.R) or UserInputService:IsKeyDown(Enum.KeyCode.F) then
+        return false, nil
+    end
     local now = os.clock()
-    local activeKey = rawget(Env, "__BFActiveSkillKey")
     for kc, kName in pairs(SKILL_KEYS) do
         if UserInputService:IsKeyDown(kc) then
             return true, kName
         end
     end
+    local activeKey = rawget(Env, "__BFActiveSkillKey")
+    if type(activeKey) ~= "string" or not COMBAT_SKILL_NAMES[activeKey] then
+        return false, nil
+    end
     local hObj = eqTool and eqTool:FindFirstChild("Holding")
     if hObj and hObj:IsA("BoolValue") and hObj.Value == true then
-        return true, (type(activeKey) == "string" and activeKey or "Z")
+        return true, activeKey
     end
-    if lastReleaseTick and (now - lastReleaseTick) <= 0.42 then
-        return true, (type(activeKey) == "string" and activeKey or nil)
+    if lastReleaseTick and (now - lastReleaseTick) <= 0.48 then
+        return true, activeKey
     end
-    if (now - lastSkillTick) <= 0.65 then
-        return true, (type(activeKey) == "string" and activeKey or nil)
+    if (now - lastSkillTick) <= 0.68 then
+        return true, activeKey
     end
     return false, nil
 end
@@ -1167,6 +1179,132 @@ local MyRunToken = (tonumber(HookState.RunToken) or 0) + 1
 HookState.RunToken = MyRunToken
 -- Explicitly clear any legacy sub-frame hook callback so zero OP_NAMECALL ever runs inside metamethods
 HookState.SyncSkillPredFn = nil
+HookState.ToolHolding = false
+
+-- Dot-indexed C functions cached at load time so metamethod checks execute as pure OP_CALL (zero OP_NAMECALL ':')
+local uisIsKeyDown = UserInputService.IsKeyDown
+local uisIsMouseDown = UserInputService.IsMouseButtonPressed
+local getCallingScriptFn = (type(getcallingscript) == "function") and getcallingscript or nil
+
+local function isCombatSkillKeyDownFast(): boolean
+    return uisIsKeyDown(UserInputService, Enum.KeyCode.Z)
+        or uisIsKeyDown(UserInputService, Enum.KeyCode.X)
+        or uisIsKeyDown(UserInputService, Enum.KeyCode.C)
+        or uisIsKeyDown(UserInputService, Enum.KeyCode.V)
+end
+
+local function isBypassedCallerScript(): boolean
+    local cs = getCallingScriptFn and getCallingScriptFn() or nil
+    if cs == nil then
+        return false
+    end
+    local nm = cs.Name
+    local par = cs.Parent
+    local pNm = par and par.Name or ""
+    -- Block all F skill modules (e.g. Portal-Portal F.Client, Rumble/Lightning F.Client)
+    if nm == "F" or pNm == "F" then
+        return true
+    end
+    -- Block all Blox Fruit M1 / Tap click modules (e.g. Portal M1, Kitsune M1, Light/Ice/Sound M1)
+    if HookState.ToolKind == "Blox Fruit" then
+        if nm == "M1" or nm == "Tap" or nm == "LeftClick" or nm == "BasicAttack"
+            or pNm == "M1" or pNm == "Tap" or pNm == "LeftClick" or pNm == "BasicAttack"
+        then
+            return true
+        end
+    end
+    local low = string.lower(nm)
+    if string.find(low, "soru", 1, true) ~= nil
+        or string.find(low, "flashstep", 1, true) ~= nil
+        or string.find(low, "dodge", 1, true) ~= nil
+    then
+        return true
+    end
+    if pNm ~= "" then
+        local pLow = string.lower(pNm)
+        if string.find(pLow, "soru", 1, true) ~= nil or string.find(pLow, "flashstep", 1, true) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+local function isBypassedActionNow(): boolean
+    local now = os.clock()
+    -- 1. Instant hardware-level Soru (R) & core Haki/Dash/Race bypass (runs BEFORE ContextActionService!)
+    if uisIsKeyDown(UserInputService, Enum.KeyCode.R) then
+        HookState.AbilityBypassUntil = now + 0.42
+        return true
+    end
+    if uisIsKeyDown(UserInputService, Enum.KeyCode.E)
+        or uisIsKeyDown(UserInputService, Enum.KeyCode.J)
+        or uisIsKeyDown(UserInputService, Enum.KeyCode.T)
+        or uisIsKeyDown(UserInputService, Enum.KeyCode.Y)
+        or uisIsKeyDown(UserInputService, Enum.KeyCode.Q)
+    then
+        HookState.AbilityBypassUntil = now + 0.32
+        return true
+    end
+
+    -- 2. Instant hardware-level F attack/mobility exclusion (Portal F, Rumble F, flights/dashes)
+    if uisIsKeyDown(UserInputService, Enum.KeyCode.F) then
+        HookState.SkillFBypassUntil = now + 0.55
+        HookState.ActiveSkillKey = "F"
+        HookState.LastSkillTick = 0
+        HookState.LastSkillRelTick = 0
+        return true
+    end
+    if HookState.ActiveSkillKey == "F" and HookState.ToolHolding == true then
+        return true
+    end
+
+    -- 3. Module caller check (Soru, F.Client, Fruit M1.Client / Tap)
+    if isBypassedCallerScript() then
+        return true
+    end
+
+    -- 4. Active Z / X / C / V press immediately cancels post-Soru / post-F / post-M1 grace timers for seamless PvP combos
+    local zxcvDown = isCombatSkillKeyDownFast()
+    if zxcvDown then
+        HookState.AbilityBypassUntil = 0
+        HookState.SkillFBypassUntil = 0
+        HookState.FruitM1BypassUntil = 0
+        return false
+    end
+
+    -- 5. Post-key / release grace windows for Soru (including hold-and-release R!) and F skills
+    if now < (tonumber(HookState.AbilityBypassUntil) or 0)
+        or now < (tonumber(HookState.SkillFBypassUntil) or 0)
+    then
+        return true
+    end
+
+    -- 6. Blox Fruit M1 Click exclusion ("clicks en fruta"): ONLY Z / X / C / V skills aim while holding a Blox Fruit!
+    if HookState.ToolKind == "Blox Fruit" then
+        local ak = HookState.ActiveSkillKey
+        local isZXCV = (ak == "Z" or ak == "X" or ak == "C" or ak == "V")
+        local holdingZXCV = (isZXCV and HookState.ToolHolding == true)
+        if not holdingZXCV and uisIsMouseDown(UserInputService, Enum.UserInputType.MouseButton1) then
+            HookState.FruitM1BypassUntil = now + 0.38
+            HookState.LastSkillTick = 0
+            HookState.LastSkillRelTick = 0
+            HookState.ActiveSkillKey = nil
+            return true
+        end
+        if now < (tonumber(HookState.FruitM1BypassUntil) or 0) then
+            return true
+        end
+        local inZXCVWindow = holdingZXCV or (isZXCV and (
+            (now - (tonumber(HookState.LastSkillTick) or 0)) <= 0.70
+            or (now - (tonumber(HookState.LastSkillRelTick) or 0)) <= 0.50
+        ))
+        if not inZXCVWindow then
+            return true
+        end
+    end
+
+    return false
+end
 
 local function isSilentHookReady(isGunRemote: boolean?, forMouse: boolean?): boolean
     if not Session.IsAlive() or not HookState.Active or HookState.PredPos == nil then
@@ -1175,11 +1313,14 @@ local function isSilentHookReady(isGunRemote: boolean?, forMouse: boolean?): boo
     if HookState.HasCombatTool ~= true then
         return false
     end
-    if os.clock() < (tonumber(HookState.AbilityBypassUntil) or 0) then
+    if isBypassedActionNow() then
         return false
     end
     if forMouse and HookState.AllowMouseOverride ~= true then
         return false
+    end
+    if HookState.ToolKind == "Blox Fruit" then
+        return HookState.ApplySkills == true
     end
     if isGunRemote or HookState.ToolKind == "Gun" then
         return HookState.ApplyGuns == true
@@ -1244,11 +1385,10 @@ end
 
 local function isAimCommECommand(cmd: string): boolean
     local low = string.lower(cmd)
-    if low == "tap" or low == "z" or low == "x" or low == "c" or low == "v" or low == "f" then
+    if low == "z" or low == "x" or low == "c" or low == "v" then
         return true
     end
-    if string.find(low, "mouse", 1, true)
-        or string.find(low, "aim", 1, true)
+    if string.find(low, "aim", 1, true)
         or string.find(low, "skill", 1, true)
         or string.find(low, "shoot", 1, true)
         or string.find(low, "fire", 1, true)
@@ -1319,7 +1459,7 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
     if not pred or not HookState.Active or HookState.HasCombatTool ~= true then
         return false
     end
-    if not HookState.AllowMouseOverride or os.clock() < (tonumber(HookState.AbilityBypassUntil) or 0) then
+    if not HookState.AllowMouseOverride or isBypassedActionNow() then
         return false
     end
     local lpChar = LocalPlayer.Character
@@ -1337,12 +1477,29 @@ local function redirectRemoteArgs(selfInst: Instance, method: string, args: { an
         return false
     end
 
+    -- Never redirect F moves, Soru, or Blox Fruit M1 clicks via remote arguments
+    if n >= 1 and type(args[1]) == "string" then
+        local cmdLow = string.lower(args[1])
+        if cmdLow == "f" or cmdLow == "soru" or cmdLow == "flashstep" then
+            return false
+        end
+        if HookState.ToolKind == "Blox Fruit"
+            and (cmdLow == "m1" or cmdLow == "tap" or cmdLow == "leftclick" or cmdLow == "click" or cmdLow == "basicattack")
+        then
+            return false
+        end
+    end
+
     if iName == "LeftClickRemote" then
+        local kind = HookState.ToolKind
+        -- Blox Fruit clicks ("clicks en fruta") must NEVER receive Silent Aim
+        if kind == "Blox Fruit" then
+            return false
+        end
         if not isSilentHookReady(true, true) then
             return false
         end
-        local kind = HookState.ToolKind
-        local maxM1Dist = (kind == "Gun" and 1500) or (kind == "Blox Fruit" and 420) or 110
+        local maxM1Dist = (kind == "Gun" and 1500) or 110
         if (tonumber(HookState.TargetDist) or math.huge) > maxM1Dist then
             return false
         end
@@ -2330,7 +2487,7 @@ TitleLbl.Font = Enum.Font.GothamBold
 TitleLbl.TextSize = 12
 TitleLbl.TextColor3 = THEME.TextPrimary
 TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-TitleLbl.Text = "DELTA · Blox Fruits v5.1"
+TitleLbl.Text = "DELTA · Blox Fruits v5.2"
 TitleLbl.Parent = Header
 
 -- Tab Pill Switcher (Silent | ESP) right in header
@@ -3018,76 +3175,134 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
         p.Refresh()
         return
     end
-    if gp then return end
+    -- Only block while typing in Chat / TextBox! Never bail on gp == true because Blox Fruits binds Soru (R), F & skills via ContextActionService (which sets gp = true!)
+    if UserInputService:GetFocusedTextBox() ~= nil then return end
 
     KeyHoldStates[code] = true
-    if code == Config.Settings.MenuKey then
-        setMenuVisible(not MenuVisible)
-        return
-    end
-    if code ~= Enum.KeyCode.Unknown and code == Config.Silent.Key then
-        if Config.Silent.Enabled and Config.Silent.Mode == "Toggle" then
-            ToggleStates.Silent = not (ToggleStates.Silent ~= false)
+    if not gp then
+        if code == Config.Settings.MenuKey then
+            setMenuVisible(not MenuVisible)
+            return
+        end
+        if code ~= Enum.KeyCode.Unknown and code == Config.Silent.Key then
+            if Config.Silent.Enabled and Config.Silent.Mode == "Toggle" then
+                ToggleStates.Silent = not (ToggleStates.Silent ~= false)
+            end
+        end
+
+        if (code ~= Enum.KeyCode.Unknown and code == Config.Silent.FocusKey)
+            or (inp.UserInputType ~= Enum.UserInputType.Keyboard and inp.UserInputType ~= Enum.UserInputType.MouseMovement and (Config.Silent.FocusKey :: any) == inp.UserInputType)
+        then
+            if Config.Silent.FocusOne then
+                Config.Silent.FocusOne = false
+                FocusedPlayer = nil
+                StickyTargetPlayer = nil
+            else
+                local picked: Player? = (ActiveLockPlayer and ActiveLockPlayer.Parent == Players) and ActiveLockPlayer or nil
+                if not picked then
+                    local cam = Workspace.CurrentCamera
+                    local ch = LocalPlayer.Character
+                    local root = ch and ch:FindFirstChild("HumanoidRootPart") :: BasePart?
+                    if cam and root then
+                        local aim2D = getAimOrigin2D()
+                        local p = evaluateSilentTarget(cam, root.Position, aim2D, os.clock(), nil, 1.5, true)
+                        picked = p
+                    end
+                end
+                FocusedPlayer = picked
+                if picked then
+                    StickyTargetPlayer = picked
+                end
+                Config.Silent.FocusOne = true
+            end
+            refreshMenuUI()
         end
     end
 
-    if (code ~= Enum.KeyCode.Unknown and code == Config.Silent.FocusKey)
-        or (inp.UserInputType ~= Enum.UserInputType.Keyboard and inp.UserInputType ~= Enum.UserInputType.MouseMovement and (Config.Silent.FocusKey :: any) == inp.UserInputType)
-    then
-        if Config.Silent.FocusOne then
-            Config.Silent.FocusOne = false
-            FocusedPlayer = nil
-            StickyTargetPlayer = nil
-        else
-            local picked: Player? = (ActiveLockPlayer and ActiveLockPlayer.Parent == Players) and ActiveLockPlayer or nil
-            if not picked then
-                local cam = Workspace.CurrentCamera
-                local ch = LocalPlayer.Character
-                local root = ch and ch:FindFirstChild("HumanoidRootPart") :: BasePart?
-                if cam and root then
-                    local aim2D = getAimOrigin2D()
-                    local p = evaluateSilentTarget(cam, root.Position, aim2D, os.clock(), nil, 1.5, true)
-                    picked = p
-                end
-            end
-            FocusedPlayer = picked
-            if picked then
-                StickyTargetPlayer = picked
-            end
-            Config.Silent.FocusOne = true
-        end
-        refreshMenuUI()
-    end
     if ABILITY_BYPASS_KEYS[inp.KeyCode] then
         local nowAb = os.clock()
-        HookState.AbilityBypassUntil = nowAb + 0.30
+        HookState.AbilityBypassUntil = nowAb + ((inp.KeyCode == Enum.KeyCode.R) and 0.42 or 0.32)
         if inp.KeyCode == Enum.KeyCode.J then
             HookState.LastManualBusoTick = nowAb
         end
+        clearRSMouseRawKeys()
+        local eqT = HookState.EquippedTool
+        local mp = eqT and eqT:FindFirstChild("MousePos")
+        if mp and mp:IsA("Vector3Value") and HookState.RawMousePos then
+            mp.Value = HookState.RawMousePos
+        end
+        return
     end
+
+    -- F skills (Portal F, Rumble F, flights/dashes) must NEVER have Silent Aim
+    if inp.KeyCode == Enum.KeyCode.F then
+        local nowF = os.clock()
+        HookState.SkillFBypassUntil = nowF + 0.55
+        HookState.ActiveSkillKey = "F"
+        Env.__BFActiveSkillKey = nil
+        HookState.LastSkillTick = 0
+        HookState.LastSkillRelTick = 0
+        Env.__BFLastSkillTick = 0
+        Env.__BFLastSkillRelTick = 0
+        HookState.GunRayWindowUntil = 0
+        clearRSMouseRawKeys()
+        local eqT = HookState.EquippedTool
+        local mp = eqT and eqT:FindFirstChild("MousePos")
+        if mp and mp:IsA("Vector3Value") and HookState.RawMousePos then
+            mp.Value = HookState.RawMousePos
+        end
+        return
+    end
+
     if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
         local nowClick = os.clock()
-        HookState.GunRayWindowUntil = nowClick + 0.50
-        local tPlr = HookState.TargetPlayer
-        local tMdl = HookState.TargetModel
-        local tPart = HookState.TargetPart
-        if HookState.Active and tPlr and tMdl and tPart and tPart.Parent then
-            local tRoot = tMdl:FindFirstChild("HumanoidRootPart") :: BasePart?
-            local tSample = tRoot and samplePlayerMotion(tPlr, tMdl, tRoot, nowClick) or MotionCache[tPlr]
-            if tSample then
-                HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
+        -- Clicks on Blox Fruit ("clicks en fruta") must NEVER have Silent Aim
+        if HookState.ToolKind == "Blox Fruit" and not isCombatSkillKeyDownFast() then
+            local ak = HookState.ActiveSkillKey
+            local holdingZXCV = ((ak == "Z" or ak == "X" or ak == "C" or ak == "V") and HookState.ToolHolding == true)
+            if not holdingZXCV then
+                HookState.FruitM1BypassUntil = nowClick + 0.38
+                HookState.GunRayWindowUntil = 0
+                HookState.LastSkillTick = 0
+                HookState.LastSkillRelTick = 0
+                Env.__BFLastSkillTick = 0
+                Env.__BFLastSkillRelTick = 0
+                HookState.ActiveSkillKey = nil
+                Env.__BFActiveSkillKey = nil
+                clearRSMouseRawKeys()
+                local eqT = HookState.EquippedTool
+                local mp = eqT and eqT:FindFirstChild("MousePos")
+                if mp and mp:IsA("Vector3Value") and HookState.RawMousePos then
+                    mp.Value = HookState.RawMousePos
+                end
             end
-            if HookState.IsHitscanGunM1 then
-                local hp, hPart, hClear = resolveHitscanAimPos(HookState.ShotOrigin, tMdl, tPart)
-                HookState.HitscanPos = hp
-                HookState.HitscanPart = hPart
-                HookState.HitscanClear = hClear
+        elseif not gp then
+            HookState.GunRayWindowUntil = nowClick + 0.50
+            local tPlr = HookState.TargetPlayer
+            local tMdl = HookState.TargetModel
+            local tPart = HookState.TargetPart
+            if HookState.Active and tPlr and tMdl and tPart and tPart.Parent then
+                local tRoot = tMdl:FindFirstChild("HumanoidRootPart") :: BasePart?
+                local tSample = tRoot and samplePlayerMotion(tPlr, tMdl, tRoot, nowClick) or MotionCache[tPlr]
+                if tSample then
+                    HookState.PredPos = BF.PredictPosition3D(tPlr, tMdl, tPart, HookState.ShotOrigin, tSample)
+                end
+                if HookState.IsHitscanGunM1 then
+                    local hp, hPart, hClear = resolveHitscanAimPos(HookState.ShotOrigin, tMdl, tPart)
+                    HookState.HitscanPos = hp
+                    HookState.HitscanPart = hPart
+                    HookState.HitscanClear = hClear
+                end
             end
         end
     end
+
     local skPressed = SKILL_KEYS[inp.KeyCode]
     if skPressed then
         local nowSk = os.clock()
+        HookState.AbilityBypassUntil = 0
+        HookState.SkillFBypassUntil = 0
+        HookState.FruitM1BypassUntil = 0
         HookState.ActiveSkillKey = skPressed
         Env.__BFActiveSkillKey = skPressed
         HookState.LastSkillTick = nowSk
@@ -3106,6 +3321,11 @@ Session.Bind(UserInputService.InputBegan, function(inp: InputObject, gp: boolean
                 HookState.PredComputedSkill = skPressed
             end
         end
+        local eqT = HookState.EquippedTool
+        local mp = eqT and eqT:FindFirstChild("MousePos")
+        if mp and mp:IsA("Vector3Value") and HookState.PredPos then
+            mp.Value = HookState.PredPos
+        end
         if isSilentHookReady(false, true) and HookState.PredPos then
             if nowSk - lastFaceSnapAt > 0.04 then
                 lastFaceSnapAt = nowSk
@@ -3118,6 +3338,21 @@ end)
 Session.Bind(UserInputService.InputEnded, function(inp: InputObject)
     local code: BindValue = (inp.KeyCode ~= Enum.KeyCode.Unknown) and inp.KeyCode or inp.UserInputType
     KeyHoldStates[code] = false
+    -- Soru (R) teleports on key RELEASE when held to preview! Keep native cursor protected across release!
+    if inp.KeyCode == Enum.KeyCode.R then
+        HookState.AbilityBypassUntil = os.clock() + 0.42
+        clearRSMouseRawKeys()
+        return
+    end
+    -- F moves (Portal F, Rumble F, held flights/dashes) also fire/finish on release: keep native cursor protected!
+    if inp.KeyCode == Enum.KeyCode.F then
+        HookState.SkillFBypassUntil = os.clock() + 0.50
+        if HookState.ActiveSkillKey == "F" then
+            HookState.ActiveSkillKey = nil
+        end
+        clearRSMouseRawKeys()
+        return
+    end
     if SKILL_KEYS[inp.KeyCode] then
         local nowR = os.clock()
         HookState.LastSkillRelTick = nowR
@@ -3555,6 +3790,8 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
     local isHitscanWeapon = (toolKind == "Gun")
         and ((eqData and eqData.HitType == "Hitscan")
             or (eqData == nil and not eqNameLow:find("guitar", 1, true) and not eqNameLow:find("cannon", 1, true) and not eqNameLow:find("bazooka", 1, true)))
+    local hObj = eqTool and eqTool:FindFirstChild("Holding")
+    HookState.ToolHolding = (hObj ~= nil and hObj:IsA("BoolValue") and hObj.Value == true)
     local usingSkillNow, activeSkKey = isSkillInputActive(
         eqTool,
         tonumber(HookState.LastSkillTick) or 0,
@@ -3562,7 +3799,8 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
     )
     HookState.PredComputedSkill = usingSkillNow and activeSkKey or nil
     HookState.IsHitscanGunM1 = (isHitscanWeapon and not usingSkillNow) == true
-    if hasCombatTool and (UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) or usingSkillNow) then
+    local m1AllowsRayWindow = (toolKind ~= "Blox Fruit") and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    if hasCombatTool and (m1AllowsRayWindow or usingSkillNow) then
         HookState.GunRayWindowUntil = math.max(tonumber(HookState.GunRayWindowUntil) or 0, now + 0.25)
     end
 
@@ -3625,12 +3863,15 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
         chancePass = math.random(1, 100) <= Config.Silent.HitChance
     end
 
-    if KeyHoldStates[Enum.KeyCode.R] == true then
-        HookState.AbilityBypassUntil = math.max(tonumber(HookState.AbilityBypassUntil) or 0, now + 0.15)
+    if UserInputService:IsKeyDown(Enum.KeyCode.R) then
+        HookState.AbilityBypassUntil = math.max(tonumber(HookState.AbilityBypassUntil) or 0, now + 0.42)
     end
-    local abilityBypassing = now < (tonumber(HookState.AbilityBypassUntil) or 0)
+    if UserInputService:IsKeyDown(Enum.KeyCode.F) then
+        HookState.SkillFBypassUntil = math.max(tonumber(HookState.SkillFBypassUntil) or 0, now + 0.55)
+    end
+    local hardHoldBypass = UserInputService:IsKeyDown(Enum.KeyCode.R) or UserInputService:IsKeyDown(Enum.KeyCode.F)
 
-    if canLock and not abilityBypassing and predPos and targetPart and targetModel and chancePass then
+    if canLock and not hardHoldBypass and predPos and targetPart and targetModel and chancePass then
         local liveHitPos = targetPart.Position
         local liveHitPart = targetPart
         local liveClear = false
@@ -3651,10 +3892,16 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
         local sp = cam:WorldToViewportPoint(visAim)
         HookState.ScreenPos = Vector2.new(sp.X, sp.Y)
 
-        -- Sync held weapon's MousePos Vector3Value only while actively locked onto a Player
+        -- Sync Tool.MousePos ONLY for non-bypassed combat actions (never for Blox Fruit M1 clicks, F moves, or Soru!)
         local mp = eqTool and eqTool:FindFirstChild("MousePos")
         if mp and mp:IsA("Vector3Value") then
-            mp.Value = visAim
+            if (toolKind == "Blox Fruit" and not usingSkillNow) or isBypassedActionNow() then
+                if HookState.RawMousePos then
+                    mp.Value = HookState.RawMousePos
+                end
+            else
+                mp.Value = visAim
+            end
         end
     else
         HookState.Active = false
@@ -3669,6 +3916,10 @@ Session.Bind(RunService.RenderStepped, function(dt: number)
         HookState.TargetPart = nil
         HookState.TargetDist = math.huge
         clearRSMouseRawKeys()
+        local mp = eqTool and eqTool:FindFirstChild("MousePos")
+        if mp and mp:IsA("Vector3Value") and HookState.RawMousePos then
+            mp.Value = HookState.RawMousePos
+        end
     end
 
     -- FOV Circle & Predicted Lead Visuals
